@@ -9,7 +9,7 @@ Claude Yelp provides a TUI (Text User Interface) for managing Claude Code CLI se
 ## Features
 
 - **Two-panel interface**: Left panel shows session list, right panel shows conversation thread
-- **Keyboard navigation**: 
+- **Keyboard navigation**:
   - `↑/↓` - Navigate session list
   - `PageUp/PageDown` - Scroll conversation thread
   - `t` - Tag a session
