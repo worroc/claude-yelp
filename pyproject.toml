@@ -1,0 +1,59 @@
+[project]
+name = "claude-yelp"
+version = "0.1.0"
+description = "A terminal-based session manager for Claude Code CLI"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "Ilya Levin"}
+]
+keywords = ["claude", "cli", "session-manager", "tui"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+dependencies = [
+    "rich>=13.0.0",
+    "textual>=0.40.0",
+    "pyperclip>=1.8.2",
+]
+
+[project.scripts]
+claude-yelp = "claude_yelp:main"
+
+[project.urls]
+Homepage = "https://github.com/yourusername/claude-yelp"
+Repository = "https://github.com/yourusername/claude-yelp"
+Issues = "https://github.com/yourusername/claude-yelp/issues"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+dev-dependencies = []
+
+[tool.ruff]
+line-length = 100
+target-version = "py38"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W"]
+ignore = []
+
+[tool.bandit]
+exclude_dirs = [".venv", "venv"]
+# B404: subprocess import (expected for CLI tool)
+# B603: subprocess without shell (expected)
+# B606: os.exec* calls (expected for CLI tool)
+# B607: partial path in subprocess (expected)
+skips = ["B404", "B603", "B606", "B607"]
