@@ -679,6 +679,85 @@ class ThreadView(ScrollableContainer):
             content_widget.update(markdown)
 
 
+class HelpScreen(ModalScreen):
+    """Modal screen showing keyboard shortcuts"""
+
+    BINDINGS = [
+        Binding("escape", "dismiss", "Close", priority=True),
+        Binding("ctrl+k", "dismiss", "Close", priority=True),
+        Binding("up", "scroll_up", "Scroll Up", priority=True),
+        Binding("down", "scroll_down", "Scroll Down", priority=True),
+        Binding("left", "noop", "", priority=True),
+        Binding("right", "noop", "", priority=True),
+        Binding("pageup", "scroll_page_up", "Page Up", priority=True),
+        Binding("pagedown", "scroll_page_down", "Page Down", priority=True),
+        Binding("q", "dismiss", "Close", priority=True),
+    ]
+
+    HELP_TEXT = """\
+[b]Session List Panel (Left)[/b]
+  Up / Down            Navigate sessions
+  PageUp / PageDown    Scroll by 10 sessions
+  gg                   Jump to first session
+  G                    Jump to last session
+  :number              Goto session by number
+  /text                Filter sessions by text
+  s                    Start (resume) session
+  t                    Tag session
+  d                    Delete session
+  e                    Export session to markdown
+  Ctrl+n               Create new tagged session
+
+[b]Thread Panel (Right)[/b]
+  Up / Down            Scroll thread
+  PageUp / PageDown    Page scroll
+  gg                   Scroll to top
+  G                    Scroll to bottom
+  /text                Search text in thread
+  n                    Next search match
+  N                    Previous search match
+  u                    Toggle user-only messages
+  c                    Copy thread as markdown
+  y                    Yank selected text
+
+[b]General[/b]
+  Left / Right         Switch panel focus
+  Shift+Left / Right   Resize panels
+  Ctrl+k               Toggle this help
+  Ctrl+p               Command palette
+  Escape               Cancel / close dialog
+  q                    Quit"""
+
+    def compose(self) -> ComposeResult:
+        with ScrollableContainer(id="help-container"):
+            yield Static("Keyboard Shortcuts", id="help-title")
+            yield Static(self.HELP_TEXT)
+            yield Static("Press ESC or Ctrl+K to close", id="help-footer")
+
+    def on_mount(self):
+        """Focus the scrollable container"""
+        container = self.query_one("#help-container")
+        container.focus()
+
+    def on_key(self, event) -> None:
+        """Intercept all keys to prevent leaking to parent app"""
+        container = self.query_one("#help-container")
+        key = event.key
+        if key in ("up", "k"):
+            container.scroll_up(animate=False)
+        elif key in ("down", "j"):
+            container.scroll_down(animate=False)
+        elif key == "pageup":
+            container.scroll_page_up(animate=False)
+        elif key == "pagedown":
+            container.scroll_page_down(animate=False)
+        elif key in ("escape", "q", "ctrl+k"):
+            self.dismiss()
+        # Stop all keys from reaching the app
+        event.stop()
+        event.prevent_default()
+
+
 class ClaudeYelpApp(App):
     """Main application"""
 
@@ -711,33 +790,70 @@ class ClaudeYelpApp(App):
         background: $accent;
         text-style: bold;
     }
+
+    HelpScreen {
+        align: center middle;
+    }
+
+    #help-container {
+        width: 70;
+        max-height: 90%;
+        background: $surface;
+        border: thick $primary;
+        padding: 1 2;
+        overflow-y: auto;
+    }
+
+    #help-title {
+        text-align: center;
+        text-style: bold;
+        margin-bottom: 1;
+    }
+
+    #help-footer {
+        text-align: center;
+        margin-top: 1;
+        color: $text-muted;
+    }
     """
 
     BINDINGS = [
-        Binding("left", "focus_left", "Focus Left Panel", priority=True),
-        Binding("right", "focus_right", "Focus Right Panel", priority=True),
-        Binding("shift+left", "resize_left", "Resize Left", priority=True),
-        Binding("shift+right", "resize_right", "Resize Right", priority=True),
-        Binding("up", "move_up", "Move Up", priority=True),
-        Binding("down", "move_down", "Move Down", priority=True),
-        Binding("pageup", "page_up", "Page Up", priority=True),
-        Binding("pagedown", "page_down", "Page Down", priority=True),
-        Binding("t", "tag_session", "Tag Session", priority=True),
+        # Shown in footer bar
+        Binding("ctrl+n", "new_session", "New Session", priority=True),
         Binding("s", "copy_session_command", "Start Session", priority=True),
-        Binding("e", "export_session", "Export Session", priority=True),
-        Binding("d", "delete_session", "Delete Session", priority=True),
-        Binding("u", "toggle_user_only", "Toggle User Only", priority=True),
-        Binding("c", "copy_thread", "Copy Thread", priority=True),
-        Binding("y", "yank", "Yank Selection", priority=True),
-        Binding(":", "command_mode", "Command Mode", priority=True),
-        Binding("/", "search_mode", "Search Mode", priority=True),
-        Binding("n", "search_next", "Next Match", priority=True),
-        Binding("N", "search_prev", "Previous Match", priority=True),
+        Binding("ctrl+k", "show_help", "Shortcuts", priority=True),
+        # Hidden from footer, available via Ctrl+K help and Ctrl+P palette
+        Binding("left", "focus_left", "Focus Left Panel", show=False, priority=True),
+        Binding("right", "focus_right", "Focus Right Panel", show=False, priority=True),
+        Binding("shift+left", "resize_left", "Resize Left", show=False, priority=True),
+        Binding("shift+right", "resize_right", "Resize Right", show=False, priority=True),
+        Binding("up", "move_up", "Move Up", show=False, priority=True),
+        Binding("down", "move_down", "Move Down", show=False, priority=True),
+        Binding("pageup", "page_up", "Page Up", show=False, priority=True),
+        Binding("pagedown", "page_down", "Page Down", show=False, priority=True),
+        Binding("t", "tag_session", "Tag Session", show=False, priority=True),
+        Binding("e", "export_session", "Export Session", show=False, priority=True),
+        Binding("d", "delete_session", "Delete Session", show=False, priority=True),
+        Binding("u", "toggle_user_only", "Toggle User Only", show=False, priority=True),
+        Binding("c", "copy_thread", "Copy Thread", show=False, priority=True),
+        Binding("y", "yank", "Yank Selection", show=False, priority=True),
+        Binding(":", "command_mode", "Command Mode", show=False, priority=True),
+        Binding("/", "search_mode", "Search Mode", show=False, priority=True),
+        Binding("n", "search_next", "Next Match", show=False, priority=True),
+        Binding("N", "search_prev", "Previous Match", show=False, priority=True),
         Binding("escape", "escape", "Cancel/Close", priority=True),
         Binding("q", "quit", "Quit", priority=True),
-        Binding("g", "go_to_top", "Go to Top", priority=True),
-        Binding("G", "go_to_bottom", "Go to Bottom", priority=True),
+        Binding("g", "go_to_top", "Go to Top", show=False, priority=True),
+        Binding("G", "go_to_bottom", "Go to Bottom", show=False, priority=True),
     ]
+
+    def check_action(self, action: str, parameters) -> bool | None:
+        """Disable app actions when a modal (like HelpScreen) is active."""
+        if any(isinstance(s, HelpScreen) for s in self.screen_stack):
+            if action == "show_help":
+                return True
+            return False
+        return True
 
     def __init__(
         self, session_manager: SessionManager, initial_session_number: Optional[int] = None
@@ -1791,11 +1907,45 @@ class ClaudeYelpApp(App):
 
         self.push_screen(CommandInputScreen(), handle_command)
 
+    def action_show_help(self):
+        """Toggle keyboard shortcuts help screen"""
+        if any(isinstance(s, HelpScreen) for s in self.screen_stack):
+            self.pop_screen()
+            return
+        self.push_screen(HelpScreen())
+
     def action_escape(self):
         """Handle ESC key - dismiss modal if one is active"""
         # Check if we have a modal screen on top
         if len(self.screen_stack) > 1:
             self.pop_screen()
+
+    def action_new_session(self):
+        """Create a new tagged session in the current directory"""
+
+        class NewSessionInputScreen(ModalScreen):
+            def compose(self):
+                yield EscapableInput(
+                    placeholder="Enter session name (ESC to cancel)", id="new-session-input"
+                )
+
+            def on_mount(self):
+                """Focus the input when mounted"""
+                input_widget = self.query_one("#new-session-input", EscapableInput)
+                input_widget.focus()
+
+            def on_input_submitted(self, event: Input.Submitted):
+                value = event.value.strip()
+                if value:
+                    self.dismiss(value)
+                else:
+                    self.dismiss(None)
+
+        def handle_new_session(tag_value: str):
+            if tag_value and tag_value.strip():
+                self.exit(result={"action": "new_session", "tag": tag_value.strip()})
+
+        self.push_screen(NewSessionInputScreen(), handle_new_session)
 
 
 def create_tagged_session(tag: str, temp: bool = False):
@@ -1956,14 +2106,16 @@ def main():
     result = app.run()
     _debug_log(f"App finished, result={result}")
 
-    # If user selected a session to resume, start claude
-    if result and isinstance(result, dict) and "session_id" in result:
-        project_dir = result["project_dir"]
-        session_id = result["session_id"]
-
-        # Change to project directory and run claude directly
-        os.chdir(project_dir)
-        os.execvp("claude", ["claude", "--resume", session_id])
+    if result and isinstance(result, dict):
+        if result.get("action") == "new_session":
+            # Create a new tagged session
+            create_tagged_session(result["tag"])
+        elif "session_id" in result:
+            # Resume an existing session
+            project_dir = result["project_dir"]
+            session_id = result["session_id"]
+            os.chdir(project_dir)
+            os.execvp("claude", ["claude", "--resume", session_id])
 
 
 if __name__ == "__main__":
