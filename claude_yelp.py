@@ -702,7 +702,7 @@ class HelpScreen(ModalScreen):
   G                    Jump to last session
   :number              Goto session by number
   /text                Filter sessions by text
-  s                    Start (resume) session
+  r                    Resume session
   t                    Tag session
   d                    Delete session
   e                    Export session to markdown
@@ -820,7 +820,7 @@ class ClaudeYelpApp(App):
     BINDINGS = [
         # Shown in footer bar
         Binding("ctrl+n", "new_session", "New Session", priority=True),
-        Binding("s", "copy_session_command", "Start Session", priority=True),
+        Binding("r", "copy_session_command", "Resume Session", priority=True),
         Binding("ctrl+k", "show_help", "Shortcuts", priority=True),
         # Hidden from footer, available via Ctrl+K help and Ctrl+P palette
         Binding("left", "focus_left", "Focus Left Panel", show=False, priority=True),
