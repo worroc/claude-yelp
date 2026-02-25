@@ -717,6 +717,8 @@ class HelpScreen(ModalScreen):
   r                    Resume session
   t                    Tag session
   d                    Delete session
+  .                    Toggle CWD filter (on by default)
+  ,                    Toggle selected project filter
   e                    Export session to markdown
   Ctrl+n               Create new tagged session
 
@@ -857,6 +859,8 @@ class ClaudeYelpApp(App):
         Binding("q", "quit", "Quit", priority=True),
         Binding("g", "go_to_top", "Go to Top", show=False, priority=True),
         Binding("G", "go_to_bottom", "Go to Bottom", show=False, priority=True),
+        Binding("full_stop", "toggle_cwd_filter", "CWD Filter", show=False, priority=True),
+        Binding("comma", "toggle_project_filter", "Project Filter", show=False, priority=True),
     ]
 
     def check_action(self, action: str, parameters) -> bool | None:
@@ -886,6 +890,10 @@ class ClaudeYelpApp(App):
         self._thread_raw_text: str = ""  # Raw text content for searching
         # Pane width (percentage for left pane)
         self._left_pane_width: int = 30
+        # CWD filter mode (ON by default)
+        self.cwd_filter_mode: bool = True
+        # Project filter mode (filter to selected session's project)
+        self.project_filter_mode: bool = False
 
     def compose(self) -> ComposeResult:
         """Create child widgets"""
@@ -905,6 +913,12 @@ class ClaudeYelpApp(App):
 
         # Set initial focus to session list
         self.set_focus(self.session_list)
+
+        # Apply default CWD filter
+        if self.cwd_filter_mode:
+            cwd = os.getcwd()
+            filtered = [s for s in self.session_manager.sessions if s.project_path == cwd]
+            self.session_list._populate(filtered)
 
         # If initial_session_number is provided, jump to that session
         if self.initial_session_number is not None:
@@ -1188,7 +1202,9 @@ class ClaudeYelpApp(App):
             if tag_value and tag_value.strip():
                 self.session_manager.tag_session(session.session_id, tag_value.strip())
                 # Refresh list but keep selection on same session
-                self.session_list._populate(initial_index=current_index)
+                self.session_list._populate(
+                    self._get_filtered_sessions(), initial_index=current_index
+                )
                 if self.thread_view:
                     self.thread_view.update_session(session)
             # If tag_value is None, user pressed ESC - do nothing
@@ -1466,13 +1482,14 @@ class ClaudeYelpApp(App):
         def handle_delete(confirmed: bool):
             if confirmed:
                 if self.session_manager.delete_session(session.session_id):
+                    filtered = self._get_filtered_sessions()
                     # Calculate the new index (same position, or last if we deleted the last one)
                     new_index = 0
-                    if self.session_manager.sessions:
-                        new_index = min(current_index, len(self.session_manager.sessions) - 1)
+                    if filtered:
+                        new_index = min(current_index, len(filtered) - 1)
 
                     # Refresh session list with the new index
-                    self.session_list._populate(initial_index=new_index)
+                    self.session_list._populate(filtered, initial_index=new_index)
 
                     # Update thread view
                     if self.session_manager.sessions:
@@ -1958,6 +1975,68 @@ class ClaudeYelpApp(App):
                 self.exit(result={"action": "new_session", "tag": tag_value.strip()})
 
         self.push_screen(NewSessionInputScreen(), handle_new_session)
+
+    def _get_filtered_sessions(self) -> List[Session]:
+        """Return sessions filtered by current filter state"""
+        if self.cwd_filter_mode:
+            cwd = os.getcwd()
+            return [s for s in self.session_manager.sessions if s.project_path == cwd]
+        if self.project_filter_mode and self.session_list:
+            session = self.session_list.get_selected_session()
+            if session:
+                return [
+                    s for s in self.session_manager.sessions
+                    if s.project_path == session.project_path
+                ]
+        return self.session_manager.sessions
+
+    def action_toggle_cwd_filter(self):
+        """Toggle CWD filter (ON by default, '.' shows all)"""
+        self.cwd_filter_mode = not self.cwd_filter_mode
+        self.project_filter_mode = False
+        self._apply_directory_filter()
+
+    def action_toggle_project_filter(self):
+        """Toggle filter to selected session's project directory"""
+        self.project_filter_mode = not self.project_filter_mode
+        if self.project_filter_mode:
+            self.cwd_filter_mode = False
+        self._apply_directory_filter()
+
+    def _apply_directory_filter(self):
+        """Repopulate session list based on current filter state"""
+        if not self.session_list:
+            return
+
+        if self.cwd_filter_mode:
+            cwd = os.getcwd()
+            filtered = [s for s in self.session_manager.sessions if s.project_path == cwd]
+            self.session_list._populate(filtered)
+            self.notify(
+                f"CWD filter ({len(filtered)})", title="Filter", severity="information", timeout=2
+            )
+        elif self.project_filter_mode:
+            session = self.session_list.get_selected_session()
+            if session:
+                project = session.project_path
+                filtered = [
+                    s for s in self.session_manager.sessions if s.project_path == project
+                ]
+                self.session_list._populate(filtered)
+                self.notify(
+                    f"Project filter: {session.project_name} ({len(filtered)})",
+                    title="Filter",
+                    severity="information",
+                    timeout=2,
+                )
+        else:
+            self.session_list._populate(self.session_manager.sessions)
+            self.notify("All sessions", title="Filter", severity="information", timeout=2)
+
+        if self.session_list and self.thread_view:
+            session = self.session_list.get_selected_session()
+            if session:
+                self.thread_view.update_session(session, user_only=self.user_only_mode)
 
 def _find_session_file(session_id: str) -> Optional[Path]:
     """Find the JSONL file for a given session ID"""
