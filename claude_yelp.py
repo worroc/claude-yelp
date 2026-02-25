@@ -178,30 +178,39 @@ class SessionManager:
         self.claude_dir = claude_dir
         self.projects_dir = claude_dir / "projects"
         self.history_file = claude_dir / "history.jsonl"
-        self.tags_file = claude_dir / "claude-yelp-tags.json"
         self.sessions: List[Session] = []
-        self.tags: Dict[str, str] = {}
-        self._load_tags()
         _debug_log("Calling _discover_sessions")
         self._discover_sessions()
+        self._migrate_tags_file()
         _debug_log(f"SessionManager.__init__ done, found {len(self.sessions)} sessions")
 
-    def _load_tags(self):
-        """Load session tags from file"""
-        if self.tags_file.exists():
-            try:
-                with open(self.tags_file, "r") as f:
-                    self.tags = json.load(f)
-            except Exception:
-                self.tags = {}
-
-    def _save_tags(self):
-        """Save session tags to file"""
+    def _migrate_tags_file(self):
+        """One-time migration: move tags from claude-yelp-tags.json into JSONL files"""
+        tags_file = self.claude_dir / "claude-yelp-tags.json"
+        if not tags_file.exists():
+            return
         try:
-            with open(self.tags_file, "w") as f:
-                json.dump(self.tags, f, indent=2)
-        except Exception as e:
-            _debug_log(f"Failed to save tags: {e}")
+            tags = json.loads(tags_file.read_text())
+        except Exception:
+            return
+
+        sessions_by_id = {s.session_id: s for s in self.sessions}
+        for session_id, tag in tags.items():
+            session = sessions_by_id.get(session_id)
+            if not session:
+                continue
+            if session.tag:
+                continue
+            entry = {"type": "custom-title", "customTitle": tag, "sessionId": session_id}
+            try:
+                with open(session.file_path, "a") as f:
+                    f.write(json.dumps(entry) + "\n")
+                session.tag = tag
+            except Exception as e:
+                _debug_log(f"Failed to migrate tag for {session_id[:8]}: {e}")
+
+        tags_file.unlink()
+        _debug_log(f"Migrated {len(tags)} tags from claude-yelp-tags.json")
 
     def _decode_project_path(self, encoded_name: str) -> str:
         """Decode Claude's encoded project path back to actual filesystem path.
@@ -308,32 +317,41 @@ class SessionManager:
                     if session_id.startswith("agent-"):
                         continue
 
-                    # Get first message and timestamp
+                    # Get first message, timestamp, and custom-title
                     first_message = None
                     timestamp = None
+                    custom_title = None
 
                     try:
                         with open(session_file, "r", encoding="utf-8") as f:
                             for line in f:
-                                line = line.strip()
-                                if not line:
+                                stripped = line.strip()
+                                if not stripped:
+                                    continue
+                                # Fast string check before JSON parse
+                                if '"custom-title"' in line:
+                                    try:
+                                        entry = json.loads(stripped)
+                                        if entry.get("type") == "custom-title":
+                                            custom_title = entry.get("customTitle")
+                                    except json.JSONDecodeError:
+                                        pass
+                                    continue
+                                if first_message:
                                     continue
                                 try:
-                                    entry = json.loads(line)
+                                    entry = json.loads(stripped)
                                     if entry.get("type") == "user" and "message" in entry:
                                         msg = entry["message"]
                                         if isinstance(msg.get("content"), str):
                                             first_message = msg["content"][:100]
                                             timestamp = entry.get("timestamp")
-                                            break
                                         elif isinstance(msg.get("content"), list):
                                             for item in msg["content"]:
                                                 if item.get("type") == "text":
                                                     first_message = item.get("text", "")[:100]
                                                     timestamp = entry.get("timestamp")
                                                     break
-                                            if first_message:
-                                                break
                                 except json.JSONDecodeError:
                                     continue
                     except Exception as e:
@@ -348,9 +366,9 @@ class SessionManager:
                         timestamp=timestamp,
                     )
 
-                    # Apply tag if exists
-                    if session_id in self.tags:
-                        session.tag = self.tags[session_id]
+                    # Apply custom-title from JSONL
+                    if custom_title:
+                        session.tag = custom_title
 
                     sessions.append(session)
 
@@ -374,13 +392,12 @@ class SessionManager:
         self.sessions = sessions
 
     def tag_session(self, session_id: str, tag: str):
-        """Tag a session"""
-        self.tags[session_id] = tag
-        self._save_tags()
-
-        # Update session object
+        """Tag a session by appending a custom-title entry to the JSONL file"""
         for session in self.sessions:
             if session.session_id == session_id:
+                entry = {"type": "custom-title", "customTitle": tag, "sessionId": session_id}
+                with open(session.file_path, "a") as f:
+                    f.write(json.dumps(entry) + "\n")
                 session.tag = tag
                 break
 
@@ -431,11 +448,6 @@ class SessionManager:
 
                 # Remove from sessions list
                 self.sessions = [s for s in self.sessions if s.session_id != session_id]
-
-                # Remove tag if exists
-                if session_id in self.tags:
-                    del self.tags[session_id]
-                    self._save_tags()
 
                 return True
             return False
@@ -1947,33 +1959,59 @@ class ClaudeYelpApp(App):
 
         self.push_screen(NewSessionInputScreen(), handle_new_session)
 
+def _find_session_file(session_id: str) -> Optional[Path]:
+    """Find the JSONL file for a given session ID"""
+    projects_dir = Path.home() / ".claude" / "projects"
+    for session_file in projects_dir.rglob(f"{session_id}.jsonl"):
+        return session_file
+    return None
+
+
+def _find_existing_tag(tag: str) -> Optional[str]:
+    """Scan all JSONL files for a custom-title matching the given tag.
+    Returns the session_id if found, None otherwise."""
+    projects_dir = Path.home() / ".claude" / "projects"
+    if not projects_dir.exists():
+        return None
+    for session_file in projects_dir.rglob("*.jsonl"):
+        if session_file.stem.startswith("agent-"):
+            continue
+        try:
+            with open(session_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                        if entry.get("type") == "custom-title" and entry.get("customTitle") == tag:
+                            return session_file.stem
+                    except json.JSONDecodeError:
+                        continue
+        except Exception:
+            continue
+    return None
+
 
 def create_tagged_session(tag: str, temp: bool = False):
     """Create a new Claude session with a tag and launch it."""
     # Check if tag already exists
-    tags_file = Path.home() / ".claude" / "claude-yelp-tags.json"
     old_session_id = None
-    if tags_file.exists():
-        try:
-            tags = json.loads(tags_file.read_text())
-            for session_id, existing_tag in tags.items():
-                if existing_tag == tag:
-                    print(f"Tag '{tag}' already exists (session {session_id[:8]})")
-                    reply = input("[Y]connect / [n]abort / [o]verwrite: ").strip().lower()
-                    if reply == "n":
-                        print("Aborted.")
-                        sys.exit(0)
-                    elif reply == "o":
-                        print("Removing old session and creating new...")
-                        old_session_id = session_id
-                        break
-                    else:
-                        print("Connecting to existing session...")
-                        env = os.environ.copy()
-                        env["CLAUDE_SESSION_ID"] = session_id
-                        os.execvpe("claude", ["claude", "--resume", session_id], env)
-        except Exception as e:
-            _debug_log(f"Failed to check existing tags: {e}")
+    existing_session_id = _find_existing_tag(tag)
+    if existing_session_id:
+        print(f"Tag '{tag}' already exists (session {existing_session_id[:8]})")
+        reply = input("[Y]connect / [n]abort / [o]verwrite: ").strip().lower()
+        if reply == "n":
+            print("Aborted.")
+            sys.exit(0)
+        elif reply == "o":
+            print("Removing old session and creating new...")
+            old_session_id = existing_session_id
+        else:
+            print("Connecting to existing session...")
+            env = os.environ.copy()
+            env["CLAUDE_SESSION_ID"] = existing_session_id
+            os.execvpe("claude", ["claude", "--resume", existing_session_id], env)
 
     init_prompt = f"Session: {tag}"
     result = subprocess.run(
@@ -2005,25 +2043,19 @@ def create_tagged_session(tag: str, temp: bool = False):
     if temp:
         print(f"Created TEMP session {session_id[:8]} with tag: {tag}")
     else:
-        # Save tag
-        tags_file = Path.home() / ".claude" / "claude-yelp-tags.json"
-        tags = {}
-        if tags_file.exists():
-            try:
-                tags = json.loads(tags_file.read_text())
-            except Exception as e:
-                _debug_log(f"Failed to load tags file: {e}")
         # Remove old session if overwriting
         if old_session_id:
-            tags.pop(old_session_id, None)
-            # Delete old session file
-            projects_dir = Path.home() / ".claude" / "projects"
-            for old_file in projects_dir.rglob(f"{old_session_id}.jsonl"):
+            old_file = _find_session_file(old_session_id)
+            if old_file:
                 old_file.unlink()
                 print(f"Removed old session {old_session_id[:8]}")
-                break
-        tags[session_id] = tag
-        tags_file.write_text(json.dumps(tags, indent=2))
+
+        # Append custom-title to the new session's JSONL file
+        session_file = _find_session_file(session_id)
+        if session_file:
+            entry = {"type": "custom-title", "customTitle": tag, "sessionId": session_id}
+            with open(session_file, "a") as f:
+                f.write(json.dumps(entry) + "\n")
         print(f"Created session {session_id[:8]} with tag: {tag}")
 
     # Launch claude with session_id in environment
@@ -2034,8 +2066,8 @@ def create_tagged_session(tag: str, temp: bool = False):
         # Run claude (not exec) so we can cleanup after
         subprocess.run(["claude", "--resume", session_id], env=env)
         # Cleanup: find and delete session file
-        projects_dir = Path.home() / ".claude" / "projects"
-        for session_file in projects_dir.rglob(f"{session_id}.jsonl"):
+        session_file = _find_session_file(session_id)
+        if session_file:
             session_file.unlink()
             # Also remove session directory if exists
             session_dir = session_file.parent / session_id
@@ -2045,7 +2077,6 @@ def create_tagged_session(tag: str, temp: bool = False):
                 except OSError:
                     pass
             print(f"Cleaned up temp session {session_id[:8]}")
-            break
         sys.exit(0)
     else:
         os.execvpe("claude", ["claude", "--resume", session_id], env)
@@ -2059,10 +2090,13 @@ def main():
 
     parser = argparse.ArgumentParser(
         description="Claude Yelp - Session manager for Claude CLI",
-        epilog="Examples: clod, clod +10, clod 'my-tag', clod -t 'temp-tag'",
+        epilog="Examples: clod, clod +10, clod 'my-tag', clod -t 'temp-tag', clod -d abc12345",
     )
     parser.add_argument(
         "--debug", action="store_true", help="Enable debug logging to /tmp/claude-yelp-debug.log"
+    )
+    parser.add_argument(
+        "-d", "--delete", metavar="SESSION_ID", help="Delete a session by ID (supports partial match)"
     )
     parser.add_argument(
         "-t", "--temp", action="store_true", help="Temporary session (deleted on exit)"
@@ -2080,6 +2114,26 @@ def main():
             source = "--debug flag" if args.debug else "CLAUDE_YELP_DEBUG env"
             f.write(f"=== claude-yelp started at {datetime.now().isoformat()} ({source}) ===\n")
         _debug_log("Debug logging enabled")
+
+    if args.delete:
+        sm = SessionManager()
+        matches = [s for s in sm.sessions if s.session_id.startswith(args.delete)]
+        if not matches:
+            print(f"No session found matching '{args.delete}'", file=sys.stderr)
+            sys.exit(1)
+        if len(matches) > 1:
+            print(f"Ambiguous ID '{args.delete}', matches {len(matches)} sessions:", file=sys.stderr)
+            for s in matches:
+                print(f"  {s.session_id}", file=sys.stderr)
+            sys.exit(1)
+        session = matches[0]
+        label = f"{session.session_id[:8]} ({session.tag})" if session.tag else session.session_id[:8]
+        if sm.delete_session(session.session_id):
+            print(f"Deleted session {label}")
+        else:
+            print(f"Failed to delete session {label}", file=sys.stderr)
+            sys.exit(1)
+        sys.exit(0)
 
     initial_session_number = None
     if args.arg:
