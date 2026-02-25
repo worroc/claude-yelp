@@ -715,7 +715,7 @@ class HelpScreen(ModalScreen):
   :number              Goto session by number
   /text                Filter sessions by text
   r                    Resume session
-  t                    Tag session
+  t / F2               Tag session
   d                    Delete session
   .                    Toggle CWD filter (on by default)
   ,                    Toggle selected project filter
@@ -846,6 +846,7 @@ class ClaudeYelpApp(App):
         Binding("pageup", "page_up", "Page Up", show=False, priority=True),
         Binding("pagedown", "page_down", "Page Down", show=False, priority=True),
         Binding("t", "tag_session", "Tag Session", show=False, priority=True),
+        Binding("f2", "tag_session", "Tag Session", show=False, priority=True),
         Binding("e", "export_session", "Export Session", show=False, priority=True),
         Binding("d", "delete_session", "Delete Session", show=False, priority=True),
         Binding("u", "toggle_user_only", "Toggle User Only", show=False, priority=True),
@@ -1178,10 +1179,16 @@ class ClaudeYelpApp(App):
         if not session:
             return
 
+        existing_tag = session.tag or ""
+
         # Use input dialog - Textual's Input widget needs to be in a screen
         class TagInputScreen(ModalScreen):
             def compose(self):
-                yield EscapableInput(placeholder="Enter tag name (ESC to cancel)", id="tag-input")
+                yield EscapableInput(
+                    value=existing_tag,
+                    placeholder="Enter tag name (ESC to cancel)",
+                    id="tag-input",
+                )
 
             def on_mount(self):
                 """Focus the input when mounted"""
@@ -2037,6 +2044,7 @@ class ClaudeYelpApp(App):
             session = self.session_list.get_selected_session()
             if session:
                 self.thread_view.update_session(session, user_only=self.user_only_mode)
+
 
 def _find_session_file(session_id: str) -> Optional[Path]:
     """Find the JSONL file for a given session ID"""
