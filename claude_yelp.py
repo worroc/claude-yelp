@@ -918,7 +918,10 @@ class ClaudeYelpApp(App):
         if self.cwd_filter_mode:
             cwd = os.getcwd()
             filtered = [s for s in self.session_manager.sessions if s.project_path == cwd]
-            self.session_list._populate(filtered)
+            if filtered:
+                self.session_list._populate(filtered)
+            else:
+                self.cwd_filter_mode = False
 
         # If initial_session_number is provided, jump to that session
         if self.initial_session_number is not None:
@@ -2017,10 +2020,17 @@ class ClaudeYelpApp(App):
         if self.cwd_filter_mode:
             cwd = os.getcwd()
             filtered = [s for s in self.session_manager.sessions if s.project_path == cwd]
-            self.session_list._populate(filtered)
-            self.notify(
-                f"CWD filter ({len(filtered)})", title="Filter", severity="information", timeout=2
-            )
+            if filtered:
+                self.session_list._populate(filtered)
+                self.notify(
+                    f"CWD filter ({len(filtered)})", title="Filter", severity="information", timeout=2
+                )
+            else:
+                self.cwd_filter_mode = False
+                self.session_list._populate(self.session_manager.sessions)
+                self.notify(
+                    "No sessions for CWD, showing all", title="Filter", severity="warning", timeout=2
+                )
         elif self.project_filter_mode:
             session = self.session_list.get_selected_session()
             if session:
