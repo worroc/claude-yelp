@@ -864,10 +864,10 @@ class ClaudeYelpApp(App):
     ]
 
     def check_action(self, action: str, parameters) -> bool | None:
-        """Disable app actions when a modal (like HelpScreen) is active."""
-        if any(isinstance(s, HelpScreen) for s in self.screen_stack):
-            if action == "show_help":
-                return True
+        """Disable app actions when a modal is active."""
+        if any(isinstance(s, ModalScreen) for s in self.screen_stack):
+            if any(isinstance(s, HelpScreen) for s in self.screen_stack):
+                return action == "show_help" or None
             return False
         return True
 
