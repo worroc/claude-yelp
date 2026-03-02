@@ -218,54 +218,53 @@ class SessionManager:
         Claude encodes paths like /home/ilya.levin/dev/project as:
         -home-ilya-levin-dev-project (dots and slashes become dashes)
 
-        We need to decode this back, handling dots in usernames and dashes in dir names.
+        We need to decode this back, handling mixed dots and dashes in names
+        like healthshield-146457-8.6.10.x-ocie-fix-db-id.
         """
-        # Remove leading dash and split by dash
         if encoded_name.startswith("-"):
             encoded_name = encoded_name[1:]
 
         parts = encoded_name.split("-")
-
-        # Try to reconstruct the path by checking which combinations exist
-        # Start from root and build up, checking filesystem
         current_path = "/"
         i = 0
 
         while i < len(parts):
-            part = parts[i]
-
-            # Try just this part
-            test_path = os.path.join(current_path, part)
+            # Fast path: try the single part first (no listdir needed)
+            test_path = os.path.join(current_path, parts[i])
             if os.path.exists(test_path):
                 current_path = test_path
                 i += 1
                 continue
 
-            # Try combining with next parts using different separators
-            found = False
-            # Try progressively longer combinations with dots and dashes
-            for j in range(i + 1, min(i + 6, len(parts) + 1)):  # Try up to 5 parts combined
-                # Try with dots (for usernames like ilya.levin)
-                combined_dot = ".".join(parts[i:j])
-                test_path = os.path.join(current_path, combined_dot)
-                if os.path.exists(test_path):
-                    current_path = test_path
-                    i = j
-                    found = True
-                    break
+            # List directory entries and find the one whose encoded form
+            # matches the longest prefix of remaining parts (greedy)
+            try:
+                entries = os.listdir(current_path)
+            except OSError:
+                current_path = os.path.join(current_path, parts[i])
+                i += 1
+                continue
 
-                # Try with dashes (for dir names like flex-host-agent)
-                combined_dash = "-".join(parts[i:j])
-                test_path = os.path.join(current_path, combined_dash)
-                if os.path.exists(test_path):
-                    current_path = test_path
-                    i = j
-                    found = True
-                    break
+            best_entry = None
+            best_len = 0
+            remaining = parts[i:]
 
-            if not found:
-                # Just use the part as-is and continue (path may not exist)
-                current_path = os.path.join(current_path, part)
+            for entry in entries:
+                # Encode entry the same way Claude does: replace dots with
+                # dashes, then split by dash
+                encoded = entry.replace(".", "-").split("-")
+                n = len(encoded)
+                if n > len(remaining) or n <= best_len:
+                    continue
+                if encoded == remaining[:n]:
+                    best_entry = entry
+                    best_len = n
+
+            if best_entry:
+                current_path = os.path.join(current_path, best_entry)
+                i += best_len
+            else:
+                current_path = os.path.join(current_path, parts[i])
                 i += 1
 
         return current_path
