@@ -3,11 +3,14 @@
 Claude Yelp - A terminal-based session manager for Claude Code CLI
 """
 
+import functools
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -21,6 +24,24 @@ from textual.widgets import Footer, Header, Input, ListItem, ListView, Static
 DEBUG_LOG_FILE = os.path.join(tempfile.gettempdir(), "claude-yelp-debug.log")
 DEBUG_ENABLED = False
 
+# Filesystems that can block forever when the server is gone.
+NETWORK_FS_TYPES = frozenset(
+    {
+        "9p",
+        "afs",
+        "cifs",
+        "fuse.davfs",
+        "fuse.sshfs",
+        "ncpfs",
+        "nfs",
+        "nfs4",
+        "smb3",
+        "smbfs",
+    }
+)
+# How long a mount gets to answer before we treat it as dead.
+MOUNT_PROBE_TIMEOUT = 1.0
+
 
 def _debug_log(msg: str):
     """Write debug message to file (only if DEBUG_ENABLED)"""
@@ -29,6 +50,58 @@ def _debug_log(msg: str):
     with open(DEBUG_LOG_FILE, "a") as f:
         f.write(f"{msg}\n")
         f.flush()
+
+
+def _network_mount_points() -> set:
+    """Mount points served over the network, read from /proc/mounts."""
+    points = set()
+    try:
+        with open("/proc/mounts", encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        return points
+
+    for line in lines:
+        fields = line.split()
+        if len(fields) >= 3 and fields[2] in NETWORK_FS_TYPES:
+            points.add(fields[1].replace("\\040", " "))
+    return points
+
+
+def _probe_mount(path: str, answered: threading.Event):
+    """stat() a mount point and signal completion. Never raises."""
+    try:
+        os.stat(path)
+    except OSError:
+        pass
+    answered.set()
+
+
+@functools.lru_cache(maxsize=1)
+def _dead_mount_points() -> frozenset:
+    """Network mounts whose server did not answer a stat() in time.
+
+    A stat() on such a mount blocks uninterruptibly, so every mount is probed
+    once, in parallel, from throwaway threads. Threads that never come back are
+    daemons and do not hold up process exit.
+    """
+    answers = {}
+    for point in _network_mount_points():
+        answered = threading.Event()
+        answers[point] = answered
+        threading.Thread(target=_probe_mount, args=(point, answered), daemon=True).start()
+
+    deadline = time.monotonic() + MOUNT_PROBE_TIMEOUT
+    for answered in answers.values():
+        answered.wait(max(0.0, deadline - time.monotonic()))
+    return frozenset(p for p, a in answers.items() if not a.is_set())
+
+
+def _is_unreachable(path: str) -> bool:
+    """True if path sits on a network mount that is not answering."""
+    return any(
+        path == point or path.startswith(point.rstrip("/") + "/") for point in _dead_mount_points()
+    )
 
 
 class EscapableInput(Input):
@@ -231,6 +304,12 @@ class SessionManager:
         while i < len(parts):
             # Fast path: try the single part first (no listdir needed)
             test_path = os.path.join(current_path, parts[i])
+
+            # Never touch a network mount whose server is gone: stat() there
+            # hangs for minutes. Decode the rest without asking the disk.
+            if _is_unreachable(test_path):
+                return os.path.join(current_path, *parts[i:])
+
             if os.path.exists(test_path):
                 current_path = test_path
                 i += 1
