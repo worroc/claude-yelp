@@ -13,17 +13,22 @@ Claude Yelp provides a TUI (Text User Interface) for managing Claude Code CLI se
 - **Session discovery**: Automatically discovers all Claude sessions from `~/.claude/projects/`
 - **Session resumption**: Directly launch Claude CLI with `--resume` flag for selected session
 - **Session creation**: Create new tagged sessions from within the TUI or from the command line
-- **Search & filter**: Search sessions by content, tag, project name, or session ID
-- **Thread search**: Search within conversation threads with match highlighting and navigation
-- **Export**: Export conversations to markdown files
+- **Search & filter**: Search sessions by content (including tool calls and tool results), tag, project name, or session ID
+- **Thread search**: Search within conversation threads with match highlighting and navigation. Tool blocks holding a match open automatically
+- **Export**: `e` or `:export` writes the conversation; `:export full` adds tool calls and results
 - **Copy to clipboard**: Copy entire thread content or yank selected text
 - **Delete sessions**: Remove sessions with confirmation dialog
 - **User-only mode**: Toggle to show only user messages in the thread view
+- **Two thread views**: by default only what the agent answered; `m` also shows its notes and one line per chain of thinking and tool calls
+- **Thread cursor**: A marker shows the current line; folding keys act on the chain or block it sits in
 - **Resizable panels**: Adjust panel widths with keyboard shortcuts
 - **Vim-style navigation**: `gg`, `G`, `/`, `n`, `N`, `:` command mode
 - **Temporary sessions**: Create sessions that are auto-deleted on exit (`-t` flag)
+- **Configurable shortcuts**: Rebind any key in `~/.config/claude-yelp/config`
 
 ## Keyboard Shortcuts
+
+These are the defaults. See [Configuration](#configuration) to change them.
 
 ### Navigation
 | Key | Action |
@@ -49,8 +54,8 @@ Claude Yelp provides a TUI (Text User Interface) for managing Claude Code CLI se
 |-----|--------|
 | `/` | Search mode (filters sessions in left panel, searches text in right panel) |
 | `n` | Next search match |
-| `N` | Previous search match |
-| `:` | Command mode (enter number to jump to session) |
+| `N` / `p` | Previous search match |
+| `:` | Command mode. A number jumps to a session, or to a line when the thread pane has focus. Commands: `export`, `export full`, `show-thinking`, `quit`. `TAB` completes |
 
 ### Clipboard
 | Key | Action |
@@ -61,9 +66,42 @@ Claude Yelp provides a TUI (Text User Interface) for managing Claude Code CLI se
 ### Other
 | Key | Action |
 |-----|--------|
+| `m` | Show/hide how the agent worked (mind view) |
 | `u` | Toggle user-only message filter |
+| `i` | Open/close the chain of steps the thread cursor is on |
+| `o` | Open/close the single tool step the thread cursor is on |
 | `Escape` | Cancel/close modal |
 | `q` | Quit |
+
+## Configuration
+
+Shortcuts can be changed in `~/.config/claude-yelp/config`. The format follows
+Ghostty: one `keybind` line per shortcut.
+
+```
+# add a key: ctrl+f also opens search
+keybind = ctrl+f=search_mode
+
+# remove a key: '/' stops opening search
+keybind = /=unbind
+
+# move delete off 'd'
+keybind = x=delete_session
+keybind = d=unbind
+```
+
+A key you bind is added, it does not replace the default. Use `unbind` to drop
+the default key.
+
+Create the file with every action listed as comments:
+
+```bash
+clod --write-config
+```
+
+Set `CLAUDE_YELP_CONFIG` to use a different path. Bad lines are reported on
+startup and skipped, so a typo never stops the tool from running. The help
+screen (`ctrl+k`) always shows the keys that are actually active.
 
 ## Installation
 

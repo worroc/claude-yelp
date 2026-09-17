@@ -6,6 +6,7 @@ Claude Yelp - A terminal-based session manager for Claude Code CLI
 import functools
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -1089,6 +1090,88 @@ class ThreadContent(Static):
     can_focus = True
 
 
+def _runs(blocks: List[Dict]):
+    """Split the thread into turns: which blocks share one heading"""
+    runs = []
+    first = 0
+    while first < len(blocks):
+        heading = ROLE_HEADINGS.get(blocks[first].get("role"))
+        last = first
+        while last + 1 < len(blocks) and ROLE_HEADINGS.get(blocks[last + 1].get("role")) == heading:
+            last += 1
+        runs.append((first, last))
+        first = last + 1
+    return runs
+
+
+def _answer_index(blocks: List[Dict], first: int, last: int) -> int:
+    """The agent's answer is the last text it wrote in the turn"""
+    for index in range(last, first - 1, -1):
+        block = blocks[index]
+        if block.get("role") == "assistant" and block.get("content", "").strip():
+            return index
+    return -1
+
+
+class ThreadBuilder:
+    """Collects the thread as styled pieces, plain text and block regions at once.
+
+    One pass gives three things that must agree: the string search runs on, the
+    styled text the pane draws, and the line range each block occupies.
+    """
+
+    def __init__(self, gutter: bool = True):
+        self.gutter = gutter
+        self.pieces = []  # (text, style) for the styled render
+        self.plain = []  # the same text, unstyled
+        self.line = 0  # lines written so far
+        self.chars = 0  # characters written so far
+        self.line_offsets = []  # where each line starts in the text
+        self.regions = []  # (first_line, last_line, fold key, role)
+
+    def _add(self, text: str, style: str = ""):
+        if not text:
+            return
+        self.pieces.append((text, style))
+        self.plain.append(text)
+        self.chars += len(text)
+
+    def add_lines(self, text: str, style: str = ""):
+        """Add text line by line, each line starting after the cursor gutter"""
+        for line in text.split("\n"):
+            self.line_offsets.append(self.chars)
+            if self.gutter:
+                self._add(GUTTER_BLANK)
+            self._add(line, style)
+            self._add("\n")
+            self.line += 1
+
+    def region(self, key, role: str):
+        """Context manager marking the lines written by one foldable thing"""
+        return _BlockRegion(self, key, role)
+
+    def text(self) -> str:
+        return "".join(self.plain)
+
+
+class _BlockRegion:
+    """Remembers which lines a block occupied, for the cursor to find it"""
+
+    def __init__(self, builder: ThreadBuilder, key, role: str):
+        self.builder = builder
+        self.key = key
+        self.role = role
+        self.first = builder.line
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        last = max(self.first, self.builder.line - 1)
+        self.builder.regions.append((self.first, last, self.key, self.role))
+        return False
+
+
 class ThreadView(ScrollableContainer):
     """View for displaying conversation thread - allows text selection"""
 
@@ -1106,22 +1189,172 @@ class ThreadView(ScrollableContainer):
         self.session_manager = session_manager
         self.current_session: Optional[Session] = None
         self._pending_update: Optional[Session] = None
+        # Off by default: only what the agent said, not how it got there
+        self.show_chain: bool = False
+        # Blocks opened one at a time from the cursor
+        self.expanded_blocks = set()
+        self.cursor_line: int = 0
+        # What the pane currently shows, so the same render is not repeated
+        self._rendered_state = None
+        self._last_args = None
+        self.rendered_text = ""
+        self.block_regions = []
+        self._rows_key = None
+        self._row_starts = []
+        self._layout_key = None
+        self._layout = None
+
+    # ------------------------------------------------------------------ rows
+
+    def content_width(self) -> int:
+        """How wide the text is drawn, in characters"""
+        try:
+            content = self.query_one("#thread-content", ThreadContent)
+        except Exception:
+            return 80
+        return max(20, content.container_size.width or content.size.width or 80)
+
+    def row_starts(self) -> List[int]:
+        """Screen row where each line of the text starts.
+
+        Long lines wrap, so a line number is not a scroll position. The rows are
+        counted once per rendering and reused while text and width stay the same.
+        """
+        text = self.rendered_text
+        width = self.content_width()
+        key = (len(text), width)
+        if self._rows_key == key:
+            return self._row_starts
+
+        console = RichConsole(width=width)
+        starts = []
+        row = 0
+        for line in text.split("\n"):
+            starts.append(row)
+            row += max(1, len(RichText(line).wrap(console, width)))
+
+        self._rows_key = key
+        self._row_starts = starts
+        return starts
+
+    def row_of_line(self, line: int) -> int:
+        """Screen row where a text line starts"""
+        starts = self.row_starts()
+        if not starts:
+            return 0
+        return starts[max(0, min(line, len(starts) - 1))]
+
+    def row_of_offset(self, char_pos: int) -> int:
+        """Screen row holding this character of the text.
+
+        Words are not cut in half when a line wraps, so the row inside a long
+        line is found by wrapping that one line, not by dividing the column.
+        """
+        text = self.rendered_text
+        line_number = text.count("\n", 0, char_pos)
+        line_start = text.rfind("\n", 0, char_pos) + 1
+        line_end = text.find("\n", char_pos)
+        line = text[line_start : line_end if line_end != -1 else len(text)]
+        column = char_pos - line_start
+
+        row = self.row_of_line(line_number)
+        width = self.content_width()
+        pieces = RichText(line).wrap(RichConsole(width=width), width)
+
+        used = 0
+        for offset, piece in enumerate(pieces):
+            used += len(piece.plain)
+            if column < used:
+                return row + offset
+            used += 1  # the space the wrap swallowed
+        return row + max(0, len(pieces) - 1)
+
+    def line_of_offset(self, char_pos: int) -> int:
+        return self.rendered_text.count("\n", 0, char_pos)
+
+    def line_count(self) -> int:
+        return len(self.row_starts())
+
+    # --------------------------------------------------------------- cursor
+
+    def move_cursor(self, delta: int):
+        """Move the cursor and scroll just enough to keep it in view"""
+        self.set_cursor(self.cursor_line + delta)
+
+    def set_cursor(self, line: int, scroll: bool = True):
+        last = max(0, self.line_count() - 1)
+        line = max(0, min(line, last))
+        if line != self.cursor_line:
+            self.cursor_line = line
+            self.redraw()
+        if scroll:
+            self.scroll_cursor_into_view()
+
+    def scroll_cursor_into_view(self):
+        """Keep a few lines of context above and below the cursor"""
+        self.scroll_row_into_view(self.row_of_line(self.cursor_line))
+
+    def scroll_row_into_view(self, row: int):
+        """Scroll just enough to put a screen row in view"""
+        top = int(self.scroll_y)
+        height = max(1, self.size.height)
+        margin = min(CURSOR_MARGIN, max(0, height // 2 - 1))
+
+        if row < top + margin:
+            self.scroll_to(0, max(0, row - margin), animate=False)
+        elif row > top + height - 1 - margin:
+            self.scroll_to(0, max(0, row - height + 1 + margin), animate=False)
+
+    def cursor_block(self):
+        """(fold key, role) the cursor sits in, or None.
+
+        Regions nest: a chain that is open lists its steps inside it, so the
+        innermost region wins.
+        """
+        found = None
+        for first, last, key, role in self.block_regions:
+            if first <= self.cursor_line <= last:
+                if found is None or (last - first) <= (found[1] - found[0]):
+                    found = (first, last, key, role)
+        return (found[2], found[3]) if found else None
+
+    def toggle_cursor_block(self, roles) -> Optional[str]:
+        """Open or close the block under the cursor. Says what happened."""
+        found = self.cursor_block()
+        if found is None or found[1] not in roles:
+            return None
+
+        key = found[0]
+        if key in self.expanded_blocks:
+            self.expanded_blocks.discard(key)
+            result = "collapsed"
+        else:
+            self.expanded_blocks.add(key)
+            result = "expanded"
+
+        self.redraw()
+        self.scroll_cursor_into_view()
+        return result
+
+    # ---------------------------------------------------------- scroll keys
 
     def action_scroll_up(self):
-        """Scroll up in thread view"""
-        self.scroll_up(animate=False)
+        """Move the cursor up one line"""
+        self.move_cursor(-1)
 
     def action_scroll_down(self):
-        """Scroll down in thread view"""
-        self.scroll_down(animate=False)
+        """Move the cursor down one line"""
+        self.move_cursor(1)
 
     def action_scroll_page_up(self):
-        """Scroll page up in thread view"""
-        self.scroll_page_up(animate=False)
+        """Move the cursor up one screen"""
+        self.move_cursor(-max(1, self.size.height - 2))
 
     def action_scroll_page_down(self):
-        """Scroll page down in thread view"""
-        self.scroll_page_down(animate=False)
+        """Move the cursor down one screen"""
+        self.move_cursor(max(1, self.size.height - 2))
+
+    # --------------------------------------------------------------- render
 
     def compose(self):
         """Compose the widget"""
@@ -1133,153 +1366,339 @@ class ThreadView(ScrollableContainer):
             self._do_update_session(self._pending_update, user_only=False)
             self._pending_update = None
 
-    def update_session(self, session: Session, user_only: bool = False, highlight_term: str = ""):
+    def update_session(
+        self,
+        session: Session,
+        user_only: bool = False,
+        highlight_term: str = "",
+        current_match=None,
+    ):
         """Update the view with a session's messages"""
+        if self.current_session is not session:
+            # A different session starts at the top, with nothing unfolded
+            self.cursor_line = 0
+            self.expanded_blocks = set()
+
+        state = (
+            session.session_id,
+            user_only,
+            highlight_term,
+            current_match,
+            self.show_chain,
+            frozenset(self.expanded_blocks),
+            self.cursor_line,
+        )
+        if state == self._rendered_state:
+            return
+
+        self._rendered_state = state
+        self._last_args = (session, user_only, highlight_term, current_match)
         self.current_session = session
         try:
-            self._do_update_session(session, user_only, highlight_term)
+            self._do_update_session(session, user_only, highlight_term, current_match)
         except Exception:
             # Widget not mounted yet, store for later
             self._pending_update = session
 
-    def _highlight_text(self, text: str, term: str) -> str:
-        """Highlight search term in text using Rich markup"""
-        if not term:
-            return text
+    def redraw(self):
+        """Draw again after the cursor moved or a block was folded"""
+        if self._last_args is None:
+            return
+        self._rendered_state = None
+        self.update_session(*self._last_args)
 
-        import re
+    def clear_content(self):
+        """Empty the view, e.g. when a search returns no sessions"""
+        self.current_session = None
+        self._pending_update = None
+        self._rendered_state = None
+        self._last_args = None
+        self.rendered_text = ""
+        self.block_regions = []
+        self.cursor_line = 0
+        self._rows_key = None
+        self._layout_key = None
+        self._layout = None
+        try:
+            self.query_one("#thread-content", ThreadContent).update("")
+        except Exception:
+            pass
 
-        # Case-insensitive replacement with highlight markup
-        # Using [reverse] for highlighting as it works well in terminals
-        pattern = re.compile(re.escape(term), re.IGNORECASE)
-        return pattern.sub(lambda m: f"[reverse yellow]{m.group(0)}[/reverse yellow]", text)
+    # ---------------------------------------------------------------- build
+
+    def build(
+        self,
+        session: Session,
+        user_only: bool = False,
+        highlight_term: str = "",
+        gutter: bool = True,
+        expand_everything: bool = False,
+    ) -> ThreadBuilder:
+        """Lay out the whole thread once.
+
+        Rendering, searching and the cursor all read the result, so a match
+        found by search is always a match that is on screen.
+        """
+        blocks = session.load_blocks()
+        if user_only:
+            blocks = [b for b in blocks if b.get("role") == "user"]
+
+        term = highlight_term.lower() if highlight_term else ""
+        out = ThreadBuilder(gutter=gutter)
+
+        out.add_lines(f"Session: {session.session_id}", "bold")
+        out.add_lines(f"Project: {session.project_path}", "dim")
+        out.add_lines(f"Date:    {session.date_str}", "dim")
+        if session.tag:
+            out.add_lines(f"Tag:     {session.tag}", "dim")
+
+        if not blocks:
+            out.add_lines("")
+            out.add_lines("No messages found in this session.", "dim italic")
+            return out
+
+        for first, last in _runs(blocks):
+            self._add_run(out, blocks, first, last, term, expand_everything)
+
+        return out
+
+    def _add_run(self, out, blocks, first, last, term, expand_everything):
+        """One speaker's turn: a user message, or everything the agent did"""
+        role = blocks[first].get("role", "unknown")
+        heading = ROLE_HEADINGS.get(role, role.title())
+
+        if heading != ROLE_HEADINGS["assistant"]:
+            self._add_heading(out, heading)
+            with out.region(first, role):
+                texts = [blocks[i].get("content", "") for i in range(first, last + 1)]
+                out.add_lines("\n\n".join(texts))
+                out.add_lines("")
+            return
+
+        # The agent's turn. Its answer is the last thing it wrote; everything
+        # before that is working: thinking, tool calls, tool results and the
+        # short notes between them.
+        answer = _answer_index(blocks, first, last)
+        pieces = self._run_pieces(blocks, first, last, answer, term, expand_everything)
+
+        self._add_heading(out, heading)
+        if not pieces:
+            # The agent worked but wrote nothing. Without this line the two user
+            # messages around it would run together.
+            with out.region(("chain", first), "chain"):
+                out.add_lines(WORKED_SILENTLY, CHAIN_STYLE)
+            out.add_lines("")
+            return
+
+        for piece in pieces:
+            piece(out)
+
+    def _run_pieces(self, blocks, first, last, answer, term, expand_everything):
+        """What of the agent's turn is worth drawing, in order"""
+        pieces = []
+        index = first
+        while index <= last:
+            role = blocks[index].get("role")
+
+            if index == answer:
+                pieces.append(self._answer_piece(blocks[index], index, role))
+                index += 1
+                continue
+
+            if role in FOLDABLE_ROLES:
+                stop = index
+                while stop + 1 <= last and blocks[stop + 1].get("role") in FOLDABLE_ROLES:
+                    stop += 1
+                piece = self._chain_piece(blocks, index, stop, term, expand_everything)
+                if piece:
+                    pieces.append(piece)
+                index = stop + 1
+                continue
+
+            piece = self._note_piece(blocks[index], index, term, expand_everything)
+            if piece:
+                pieces.append(piece)
+            index += 1
+
+        return pieces
+
+    def _add_heading(self, out, heading: str):
+        out.add_lines("")
+        rule = "━" * max(3, HEADING_WIDTH - len(heading) - 4)
+        out.add_lines(f"━━ {heading} {rule}", ROLE_STYLES.get(heading, "bold"))
+        out.add_lines("")
+
+    def _answer_piece(self, block, index, role):
+        """The text the agent finished with, always shown"""
+
+        def draw(out):
+            with out.region(index, role):
+                out.add_lines(block.get("content", ""))
+                out.add_lines("")
+
+        return draw
+
+    def _note_piece(self, block, index, term, expand_everything=False):
+        """A short note the agent wrote while working, quoted with '>'"""
+        text = block.get("content", "")
+        wanted = expand_everything or self.show_chain or (term and term in text.lower())
+        if not wanted or not text.strip():
+            return None
+
+        def draw(out):
+            with out.region(index, "assistant"):
+                for line in text.split("\n"):
+                    out.add_lines(f"> {line}" if line else ">", NOTE_STYLE)
+
+        return draw
+
+    def _chain_piece(self, blocks, first, last, term, expand_everything):
+        """A run of thinking and tool steps, shown as one line until opened"""
+        steps = list(range(first, last + 1))
+        holds_term = term and any(term in blocks[i].get("content", "").lower() for i in steps)
+
+        if not (expand_everything or self.show_chain or holds_term):
+            return None
+
+        # A chain and its first step are different things to fold, so the chain
+        # gets its own key.
+        key = ("chain", first)
+        opened = expand_everything or key in self.expanded_blocks
+        names = []
+        for i in steps:
+            name = blocks[i].get("name", "")
+            if blocks[i].get("role") != "tool_result" and name not in names:
+                names.append(name)
+        summary = ", ".join(names[:CHAIN_NAMES_SHOWN]) or "steps"
+        if len(names) > CHAIN_NAMES_SHOWN:
+            summary += ", …"
+        label = f"{CHAIN_ICON} chain ({len(steps)} steps: {summary})"
+
+        if not (opened or holds_term):
+
+            def draw(out):
+                with out.region(key, "chain"):
+                    out.add_lines(label, CHAIN_STYLE)
+
+            return draw
+
+        def draw(out):
+            # The header stays when the chain is open, so it can be closed again
+            with out.region(key, "chain"):
+                out.add_lines(label, CHAIN_STYLE)
+            for i in steps:
+                with out.region(i, blocks[i].get("role")):
+                    self._add_foldable(out, blocks[i], i, term, expand_everything)
+
+        return draw
+
+    def _add_foldable(self, out, block, index, term, expand_everything):
+        """One tool call, tool result or thinking block"""
+        text = block.get("content", "")
+        role = block.get("role")
+        name = block.get("name", role)
+        icon = FOLDABLE_ICONS.get(role, "*")
+        style = FOLDABLE_STYLES.get(role, "dim")
+
+        is_open = (
+            expand_everything or index in self.expanded_blocks or (term and term in text.lower())
+        )
+
+        if not is_open:
+            if not text.strip():
+                out.add_lines(f"{icon} {name}: (no text output)", style)
+                return
+            lines = text.splitlines()
+            flat = " ".join(text.split())
+            head = flat[:TOOL_PREVIEW_CHARS]
+            if len(flat) > TOOL_PREVIEW_CHARS:
+                head += " …"
+            extra = f" ({len(lines)} lines)" if len(lines) > 1 else ""
+            out.add_lines(f"{icon} {name}{extra}: {head}", style)
+            return
+
+        out.add_lines(f"{icon} {name}", style)
+        out.add_lines(text)
+        out.add_lines("")
+
+    def build_text(
+        self,
+        session: Session,
+        user_only: bool = False,
+        highlight_term: str = "",
+    ) -> str:
+        """The exact text the pane shows"""
+        return self.build(session, user_only=user_only, highlight_term=highlight_term).text()
+
+    def export_text(self, session: Session, full: bool = False, user_only: bool = False) -> str:
+        """Thread text for a file or the clipboard: no cursor gutter"""
+        return self.build(
+            session, user_only=user_only, gutter=False, expand_everything=full
+        ).text()
 
     def _do_update_session(
-        self, session: Session, user_only: bool = False, highlight_term: str = ""
+        self,
+        session: Session,
+        user_only: bool = False,
+        highlight_term: str = "",
+        current_match=None,
     ):
         """Internal method to update the session view"""
-        messages = session.load_messages()
+        # Moving the cursor changes only which gutter is lit, so the layout is
+        # kept and reused. Rebuilding it on every keypress was far too slow.
+        key = (
+            session.session_id,
+            user_only,
+            highlight_term,
+            self.show_chain,
+            frozenset(self.expanded_blocks),
+        )
+        if key != self._layout_key:
+            built = self.build(session, user_only=user_only, highlight_term=highlight_term)
+            self._layout_key = key
+            self._layout = built
+            self.rendered_text = built.text()
+            self.block_regions = built.regions
+            self._rows_key = None
 
-        # Filter to user messages only if requested
-        if user_only:
-            messages = [msg for msg in messages if msg.get("role") == "user"]
+        built = self._layout
+        rendered = RichText()
+        for piece, style in built.pieces:
+            rendered.append(piece, style or None)
 
-        from rich.markdown import Markdown
-        from rich.text import Text
-
-        content = []
-        content.append(f"# Session: {session.session_id}\n\n")
-        content.append(f"**Project:** `{session.project_path}`\n\n")
-        content.append(f"**Date:** {session.date_str}\n\n")
-        if session.tag:
-            content.append(f"**Tag:** {session.tag}\n\n")
-        if user_only:
-            content.append("**Filter:** User messages only\n\n")
-        if highlight_term:
-            content.append(f"**Search:** `{highlight_term}`\n\n")
-        content.append("---\n\n")
-
-        # Group consecutive messages with the same role
-        if not messages:
-            content.append("*No messages found in this session.*\n")
-        else:
-            i = 0
-            while i < len(messages):
-                current_role = messages[i].get("role", "unknown")
-                combined_texts = [messages[i].get("content", "")]
-
-                # Collect consecutive messages with the same role
-                j = i + 1
-                while j < len(messages) and messages[j].get("role") == current_role:
-                    combined_texts.append(messages[j].get("content", ""))
-                    j += 1
-
-                # Combine the texts
-                combined_text = "\n\n".join(combined_texts)
-
-                # Highlight search term if provided
-                if highlight_term:
-                    combined_text = self._highlight_text(combined_text, highlight_term)
-
-                # Format based on role
-                if current_role == "user":
-                    content.append(f"## 👤 User\n\n{combined_text}\n\n")
-                elif current_role == "assistant":
-                    content.append(f"## 🤖 Assistant\n\n{combined_text}\n\n")
-                elif current_role == "error":
-                    content.append(f"## ❌ Error\n\n{combined_text}\n\n")
-                else:
-                    content.append(f"## {current_role.title()}\n\n{combined_text}\n\n")
-
-                i = j
-
-        content_widget = self.query_one("#thread-content", ThreadContent)
+        if 0 <= self.cursor_line < len(built.line_offsets):
+            start = built.line_offsets[self.cursor_line]
+            rendered.stylize(CURSOR_STYLE, start, start + len(GUTTER_BLANK))
 
         if highlight_term:
-            # Use Rich Text with markup for highlighting (can't use Markdown with highlights)
-            content_widget.update(Text.from_markup("".join(content)))
-        else:
-            # Use Markdown for normal rendering
-            markdown = Markdown("".join(content))
-            content_widget.update(markdown)
+            rendered.highlight_regex(f"(?i){re.escape(highlight_term)}", style="reverse yellow")
+            if current_match:
+                # The match you are standing on stands out from the rest
+                start, end = current_match
+                rendered.stylize(CURRENT_MATCH_STYLE, start, end)
 
+        self.query_one("#thread-content", ThreadContent).update(rendered)
 
 class HelpScreen(ModalScreen):
     """Modal screen showing keyboard shortcuts"""
 
     BINDINGS = [
-        Binding("escape", "dismiss", "Close", priority=True),
-        Binding("ctrl+k", "dismiss", "Close", priority=True),
         Binding("up", "scroll_up", "Scroll Up", priority=True),
         Binding("down", "scroll_down", "Scroll Down", priority=True),
         Binding("left", "noop", "", priority=True),
         Binding("right", "noop", "", priority=True),
         Binding("pageup", "scroll_page_up", "Page Up", priority=True),
         Binding("pagedown", "scroll_page_down", "Page Down", priority=True),
-        Binding("q", "dismiss", "Close", priority=True),
-    ]
+    ] + [Binding(key, "dismiss", "Close", priority=True) for key in sorted(HELP_CLOSE_KEYS)]
 
-    HELP_TEXT = """\
-[b]Session List Panel (Left)[/b]
-  Up / Down            Navigate sessions
-  PageUp / PageDown    Scroll by 10 sessions
-  gg                   Jump to first session
-  G                    Jump to last session
-  :number              Goto session by number
-  /text                Filter sessions by text
-  r                    Resume session
-  t / F2               Tag session
-  d                    Delete session
-  .                    Toggle CWD filter (on by default)
-  ,                    Toggle selected project filter
-  e                    Export session to markdown
-  Ctrl+n               Create new tagged session
-
-[b]Thread Panel (Right)[/b]
-  Up / Down            Scroll thread
-  PageUp / PageDown    Page scroll
-  gg                   Scroll to top
-  G                    Scroll to bottom
-  /text                Search text in thread
-  n                    Next search match
-  N                    Previous search match
-  u                    Toggle user-only messages
-  c                    Copy thread as markdown
-  y                    Yank selected text
-
-[b]General[/b]
-  Left / Right         Switch panel focus
-  Shift+Left / Right   Resize panels
-  Ctrl+k               Toggle this help
-  Ctrl+p               Command palette
-  Escape               Cancel / close dialog
-  q                    Quit"""
+    HELP_TEXT = APP_HELP_TEXT
 
     def compose(self) -> ComposeResult:
         with ScrollableContainer(id="help-container"):
             yield Static("Keyboard Shortcuts", id="help-title")
             yield Static(self.HELP_TEXT)
-            yield Static("Press ESC or Ctrl+K to close", id="help-footer")
+            closers = " / ".join(sorted(format_key(k) for k in HELP_CLOSE_KEYS))
+            yield Static(f"Press {closers} to close", id="help-footer")
 
     def on_mount(self):
         """Focus the scrollable container"""
@@ -1453,28 +1872,46 @@ class ClaudeYelpApp(App):
             # Update thread view with first session
             session = self.session_list.get_selected_session()
             if session:
-                self.thread_view.update_session(session, user_only=self.user_only_mode)
+                self._show_session(session)
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         """Handle session selection"""
-        if self.session_list and self.thread_view:
+        if self.session_list is not None and self.thread_view is not None:
             session = self.session_list.get_selected_session()
             if session:
-                self.thread_view.update_session(session, user_only=self.user_only_mode)
+                self._show_session(session)
 
     def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
-        """Handle list view highlight changes"""
-        # Ensure the highlighted item is visible
-        pass
+        """Follow the highlighted session in the thread pane.
+
+        The list moves for many reasons: our own keys, a mouse click, or
+        ListView's built-in keys when a navigation key is unbound in the config.
+        Reacting to the move covers all of them.
+        """
+        if self.session_list is None or self.thread_view is None:
+            return
+        session = self.session_list.get_selected_session()
+        if session is None:
+            return
+
+        # Match positions belong to one session's text, so moving away drops them
+        current = self.thread_view.current_session
+        if self._thread_search_term and (current is None or current is not session):
+            self._thread_search_term = ""
+            self._thread_search_matches = []
+            self._thread_search_index = -1
+            self._thread_raw_text = ""
+
+        self._show_session(session)
 
     def action_focus_left(self):
         """Focus the left panel (session list)"""
-        if self.session_list:
+        if self.session_list is not None:
             self.set_focus(self.session_list)
 
     def action_focus_right(self):
         """Focus the right panel (thread view)"""
-        if self.thread_view:
+        if self.thread_view is not None:
             self.set_focus(self.thread_view)
 
     def action_resize_left(self):
@@ -1500,11 +1937,11 @@ class ClaudeYelpApp(App):
         focused = self.focused
         if focused == self.session_list:
             # Navigate session list - use current displayed sessions
-            if self.session_list and self.session_list.index > 0:
+            if self.session_list is not None and self.session_list.index:
                 self.session_list.index -= 1
                 session = self.session_list.get_selected_session()
-                if session and self.thread_view:
-                    self.thread_view.update_session(session, user_only=self.user_only_mode)
+                if session and self.thread_view is not None:
+                    self._show_session(session)
         elif focused == self.thread_view:
             # Delegate to thread view's scroll action
             self.thread_view.action_scroll_up()
@@ -1514,16 +1951,13 @@ class ClaudeYelpApp(App):
         focused = self.focused
         if focused == self.session_list:
             # Navigate session list - use current displayed sessions
-            current_sessions = (
-                self.session_list._sessions_to_display
-                if self.session_list._sessions_to_display
-                else self.session_manager.sessions
-            )
-            if self.session_list and self.session_list.index < len(current_sessions) - 1:
+            current_sessions = self.session_list._displayed_sessions()
+            index = self.session_list.index if self.session_list is not None else None
+            if index is not None and index < len(current_sessions) - 1:
                 self.session_list.index += 1
                 session = self.session_list.get_selected_session()
-                if session and self.thread_view:
-                    self.thread_view.update_session(session, user_only=self.user_only_mode)
+                if session and self.thread_view is not None:
+                    self._show_session(session)
         elif focused == self.thread_view:
             # Delegate to thread view's scroll action
             self.thread_view.action_scroll_down()
@@ -1537,13 +1971,13 @@ class ClaudeYelpApp(App):
         elif focused == self.session_list:
             # If session list is focused, scroll it
             # ListView doesn't have page scroll by default, so scroll by multiple items
-            if self.session_list and self.session_list.index > 0:
+            if self.session_list is not None and self.session_list.index:
                 # Scroll up by a page worth (approximately 10 items or visible height)
                 new_index = max(0, self.session_list.index - 10)
                 self.session_list.index = new_index
                 session = self.session_list.get_selected_session()
-                if session and self.thread_view:
-                    self.thread_view.update_session(session, user_only=self.user_only_mode)
+                if session and self.thread_view is not None:
+                    self._show_session(session)
         # Don't change focus - only work in active pane
 
     def action_page_down(self):
@@ -1554,18 +1988,15 @@ class ClaudeYelpApp(App):
             self.thread_view.action_scroll_page_down()
         elif focused == self.session_list:
             # If session list is focused, scroll it
-            current_sessions = (
-                self.session_list._sessions_to_display
-                if self.session_list._sessions_to_display
-                else self.session_manager.sessions
-            )
-            if self.session_list and self.session_list.index < len(current_sessions) - 1:
+            current_sessions = self.session_list._displayed_sessions()
+            index = self.session_list.index if self.session_list is not None else None
+            if index is not None and index < len(current_sessions) - 1:
                 # Scroll down by a page worth (approximately 10 items or visible height)
                 new_index = min(len(current_sessions) - 1, self.session_list.index + 10)
                 self.session_list.index = new_index
                 session = self.session_list.get_selected_session()
-                if session and self.thread_view:
-                    self.thread_view.update_session(session, user_only=self.user_only_mode)
+                if session and self.thread_view is not None:
+                    self._show_session(session)
         # Don't change focus - only work in active pane
 
     def action_go_to_top(self):
@@ -1580,14 +2011,14 @@ class ClaudeYelpApp(App):
             focused = self.focused
             if focused == self.session_list:
                 # Go to first session
-                if self.session_list:
+                if self.session_list is not None:
                     self.session_list.index = 0
                     session = self.session_list.get_selected_session()
-                    if session and self.thread_view:
-                        self.thread_view.update_session(session, user_only=self.user_only_mode)
+                    if session and self.thread_view is not None:
+                        self._show_session(session)
             elif focused == self.thread_view:
                 # Scroll to top of thread
-                if self.thread_view:
+                if self.thread_view is not None:
                     # Scroll to the beginning
                     self.thread_view.scroll_to(0, 0, animate=False)
 
@@ -1601,19 +2032,15 @@ class ClaudeYelpApp(App):
         focused = self.focused
         if focused == self.session_list:
             # Go to last session
-            current_sessions = (
-                self.session_list._sessions_to_display
-                if self.session_list._sessions_to_display
-                else self.session_manager.sessions
-            )
-            if self.session_list and current_sessions:
+            current_sessions = self.session_list._displayed_sessions()
+            if self.session_list is not None and current_sessions:
                 self.session_list.index = len(current_sessions) - 1
                 session = self.session_list.get_selected_session()
-                if session and self.thread_view:
-                    self.thread_view.update_session(session, user_only=self.user_only_mode)
+                if session and self.thread_view is not None:
+                    self._show_session(session)
         elif focused == self.thread_view:
             # Scroll to absolute bottom of thread
-            if self.thread_view:
+            if self.thread_view is not None:
                 try:
                     # Get the content widget to find its dimensions
                     content_widget = self.thread_view.query_one("#thread-content", ThreadContent)
@@ -1727,15 +2154,15 @@ class ClaudeYelpApp(App):
                 self.session_list._populate(
                     self._get_filtered_sessions(), initial_index=current_index
                 )
-                if self.thread_view:
-                    self.thread_view.update_session(session)
+                if self.thread_view is not None:
+                    self._show_session(session)
             # If tag_value is None, user pressed ESC - do nothing
 
         self.push_screen(TagInputScreen(), handle_tag)
 
     def action_copy_session_command(self):
         """Start claude session in the project directory"""
-        if not self.session_list:
+        if self.session_list is None:
             return
 
         session = self.session_list.get_selected_session()
@@ -1763,51 +2190,15 @@ class ClaudeYelpApp(App):
 
     def action_copy_thread(self):
         """Copy current thread content to clipboard as markdown"""
-        if not self.session_list:
+        if self.session_list is None:
             return
 
         session = self.session_list.get_selected_session()
-        if not session:
+        if not session or self.thread_view is None:
             return
 
-        # Build markdown content (similar to export)
-        messages = session.load_messages()
-
-        content = []
-        content.append(f"# Session: {session.session_id}\n\n")
-        content.append(f"**Project:** `{session.project_path}`\n\n")
-        content.append(f"**Date:** {session.date_str}\n\n")
-        if session.tag:
-            content.append(f"**Tag:** {session.tag}\n\n")
-        content.append("---\n\n")
-
-        if not messages:
-            content.append("*No messages found in this session.*\n")
-        else:
-            i = 0
-            while i < len(messages):
-                current_role = messages[i].get("role", "unknown")
-                combined_texts = [messages[i].get("content", "")]
-
-                j = i + 1
-                while j < len(messages) and messages[j].get("role") == current_role:
-                    combined_texts.append(messages[j].get("content", ""))
-                    j += 1
-
-                combined_text = "\n\n".join(combined_texts)
-
-                if current_role == "user":
-                    content.append(f"## User\n\n{combined_text}\n\n")
-                elif current_role == "assistant":
-                    content.append(f"## Assistant\n\n{combined_text}\n\n")
-                elif current_role == "error":
-                    content.append(f"## Error\n\n{combined_text}\n\n")
-                else:
-                    content.append(f"## {current_role.title()}\n\n{combined_text}\n\n")
-
-                i = j
-
-        markdown_content = "".join(content)
+        # The same text the pane shows, without the cursor gutter
+        markdown_content = self.thread_view.export_text(session, user_only=self.user_only_mode)
 
         # Copy to clipboard
         try:
@@ -1893,57 +2284,35 @@ class ClaudeYelpApp(App):
                     timeout=2,
                 )
 
-    def action_export_session(self):
-        """Export current session thread as markdown file"""
-        if not self.session_list:
+    def action_export_session(self, full: bool = False):
+        """Export current session thread as a markdown file.
+
+        Plain export keeps the conversation only. A full export adds thinking,
+        tool calls and tool results, all opened.
+        """
+        if self.session_list is None:
             return
 
         session = self.session_list.get_selected_session()
         if not session:
             return
 
-        # Build filename: <session-id>-<tag>.md or <session-id>.md
+        suffix = "-full" if full else ""
         if session.tag:
-            filename = f"{session.session_id}-{session.tag}.md"
+            filename = f"{session.session_id}-{session.tag}{suffix}.md"
         else:
-            filename = f"{session.session_id}.md"
+            filename = f"{session.session_id}{suffix}.md"
 
-        # Get current working directory
-        cwd = os.getcwd()
-        filepath = os.path.join(cwd, filename)
+        filepath = os.path.join(os.getcwd(), filename)
 
         try:
-            # Load messages
-            messages = session.load_messages()
+            if full and self.thread_view is not None:
+                body = self.thread_view.export_text(session, full=True)
+            else:
+                body = self._plain_export_text(session)
 
-            # Build markdown content
-            content = []
-            content.append(f"# Claude Session: {session.session_id}\n\n")
-            content.append(f"**Project:** `{session.project_path}`\n\n")
-            content.append(f"**Date:** {session.date_str}\n\n")
-            if session.tag:
-                content.append(f"**Tag:** {session.tag}\n\n")
-            content.append("---\n\n")
-
-            # Add messages
-            for msg in messages:
-                role = msg.get("role", "unknown")
-                text = msg.get("content", "")
-
-                if role == "user":
-                    content.append(f"## 👤 User\n\n{text}\n\n")
-                elif role == "assistant":
-                    # For export, keep plain text (no Rich markup)
-                    content.append(f"## 🤖 Assistant\n\n{text}\n\n")
-                elif role == "error":
-                    content.append(f"## ❌ Error\n\n{text}\n\n")
-
-            if not messages:
-                content.append("*No messages found in this session.*\n")
-
-            # Write to file
             with open(filepath, "w", encoding="utf-8") as f:
-                f.write("".join(content))
+                f.write(body)
 
             self.notify(
                 f"Exported to: {filepath}",
@@ -1957,9 +2326,33 @@ class ClaudeYelpApp(App):
                 f"Error exporting session: {e}", title="Export Error", severity="error", timeout=5
             )
 
+    def _plain_export_text(self, session: Session) -> str:
+        """Conversation only, as markdown"""
+        messages = session.load_messages()
+
+        content = []
+        content.append(f"# Claude Session: {session.session_id}\n\n")
+        content.append(f"**Project:** `{session.project_path}`\n\n")
+        content.append(f"**Date:** {session.date_str}\n\n")
+        if session.tag:
+            content.append(f"**Tag:** {session.tag}\n\n")
+        content.append("---\n\n")
+
+        for msg in messages:
+            role = msg.get("role", "unknown")
+            text = msg.get("content", "")
+            heading = ROLE_HEADINGS.get(role)
+            if heading:
+                content.append(f"## {heading}\n\n{text}\n\n")
+
+        if not messages:
+            content.append("*No messages found in this session.*\n")
+
+        return "".join(content)
+
     def action_delete_session(self):
         """Delete the current session"""
-        if not self.session_list:
+        if self.session_list is None:
             return
 
         session = self.session_list.get_selected_session()
@@ -2016,11 +2409,11 @@ class ClaudeYelpApp(App):
                     # Update thread view
                     if self.session_manager.sessions:
                         new_session = self.session_list.get_selected_session()
-                        if new_session and self.thread_view:
-                            self.thread_view.update_session(new_session)
+                        if new_session and self.thread_view is not None:
+                            self._show_session(new_session)
                     else:
                         # No sessions left, clear thread view
-                        if self.thread_view:
+                        if self.thread_view is not None:
                             from rich.markdown import Markdown
 
                             empty_content = Markdown("# No Sessions\n\nNo sessions available.")
@@ -2049,10 +2442,10 @@ class ClaudeYelpApp(App):
         self.user_only_mode = not self.user_only_mode
 
         # Update thread view with current filter state
-        if self.session_list and self.thread_view:
+        if self.session_list is not None and self.thread_view is not None:
             session = self.session_list.get_selected_session()
             if session:
-                self.thread_view.update_session(session, user_only=self.user_only_mode)
+                self._show_session(session)
 
         # Show notification
         mode_text = "User messages only" if self.user_only_mode else "All messages"
@@ -2060,15 +2453,60 @@ class ClaudeYelpApp(App):
             f"Filter: {mode_text}", title="Filter Toggled", severity="information", timeout=2
         )
 
+    def action_toggle_chain(self):
+        """Show or hide how the agent worked, not just what it answered"""
+        if self.thread_view is None or self.session_list is None:
+            return
+
+        self.thread_view.show_chain = not self.thread_view.show_chain
+
+        session = self.session_list.get_selected_session()
+        if session:
+            self._show_session(session)
+            self._refind_matches()
+
+        state = "shown" if self.thread_view.show_chain else "hidden"
+        self.notify(
+            f"Agent's working steps {state}", title="Thread", severity="information", timeout=2
+        )
+
+    def action_toggle_chain_block(self):
+        """Open or close the chain of steps the cursor sits in"""
+        self._toggle_block(CHAIN_FOLD_ROLES, "chain")
+
+    def action_toggle_tool_output(self):
+        """Open or close the single tool step the cursor sits in"""
+        self._toggle_block(TOOL_FOLD_ROLES, "tool step")
+
+    def _toggle_block(self, roles, what: str):
+        """Fold or unfold the block under the thread cursor"""
+        if self.thread_view is None:
+            return
+
+        result = self.thread_view.toggle_cursor_block(roles)
+        if result is None:
+            self.notify(
+                f"Cursor is not on a {what}", title="Thread", severity="warning", timeout=2
+            )
+            return
+
+        self._refind_matches()
+        self.notify(f"{what.title()} {result}", title="Thread", severity="information", timeout=2)
+
+    def _refind_matches(self):
+        """Folding moves text around, so the matches are found again"""
+        if self._thread_search_term:
+            self._search_in_thread(self._thread_search_term)
+
     def _search_sessions(self, query: str) -> List[Session]:
-        """Search sessions by query string"""
+        """Search sessions by query string, inside the active directory filter"""
         if not query or not query.strip():
-            return self.session_manager.sessions
+            return self._get_filtered_sessions()
 
         query_lower = query.lower().strip()
         matching_sessions = []
 
-        for session in self.session_manager.sessions:
+        for session in self._get_filtered_sessions():
             # Search in session ID
             if query_lower in session.session_id.lower():
                 matching_sessions.append(session)
@@ -2206,12 +2644,10 @@ class ClaudeYelpApp(App):
         _debug_log(f"Found {len(self._thread_search_matches)} matches")
 
         # Refresh thread view with highlighting
-        if self.thread_view and self.session_list:
+        if self.thread_view is not None and self.session_list is not None:
             session = self.session_list.get_selected_session()
             if session:
-                self.thread_view.update_session(
-                    session, user_only=self.user_only_mode, highlight_term=query
-                )
+                self._show_session(session)
 
         if self._thread_search_matches:
             self._thread_search_index = 0
@@ -2227,29 +2663,26 @@ class ClaudeYelpApp(App):
             self.notify(f"No matches for '{query}'", title="Search", severity="warning", timeout=2)
 
     def _jump_to_thread_match(self, match_index: int):
-        """Jump to a specific match in the thread view"""
+        """Put the cursor on a match and bring it into view"""
         if not self._thread_search_matches or match_index < 0:
             return
 
         if match_index >= len(self._thread_search_matches):
             match_index = 0
+        if self.thread_view is None or self.session_list is None:
+            return
 
-        _debug_log(f"_jump_to_thread_match: index={match_index}")
+        # Redraw first: the match being stood on is drawn differently
+        session = self.session_list.get_selected_session()
+        if session:
+            self._show_session(session)
 
-        # Calculate approximate line number based on character position
+        # A long line wraps over many rows, so the cursor goes on the line and
+        # the view is scrolled to the row the match itself sits on.
         char_pos = self._thread_search_matches[match_index]
-        text_before = self._thread_raw_text[:char_pos]
-        line_number = text_before.count("\n")
-
-        _debug_log(f"Match at char {char_pos}, approx line {line_number}")
-
-        # Scroll thread view to that position
-        if self.thread_view:
-            # Estimate scroll position (rough approximation)
-            # Each line is roughly 1 unit of scroll
-            scroll_y = max(0, line_number - 5)  # Show a few lines above
-            self.thread_view.scroll_to(0, scroll_y, animate=False)
-            _debug_log(f"Scrolled to y={scroll_y}")
+        self.thread_view.set_cursor(self.thread_view.line_of_offset(char_pos), scroll=False)
+        self.thread_view.scroll_row_into_view(self.thread_view.row_of_offset(char_pos))
+        _debug_log(f"match {match_index} at char {char_pos}, line {self.thread_view.cursor_line}")
 
     def _clear_thread_search(self):
         """Clear thread search state"""
@@ -2259,10 +2692,10 @@ class ClaudeYelpApp(App):
         self._thread_raw_text = ""
 
         # Refresh thread view without highlighting
-        if self.thread_view and self.session_list:
+        if self.thread_view is not None and self.session_list is not None:
             session = self.session_list.get_selected_session()
             if session:
-                self.thread_view.update_session(session, user_only=self.user_only_mode)
+                self._show_session(session)
 
     def action_search_next(self):
         """Jump to next search match in thread"""
@@ -2639,10 +3072,19 @@ class ClaudeYelpApp(App):
             self.session_list._populate(self.session_manager.sessions)
             self.notify("All sessions", title="Filter", severity="information", timeout=2)
 
-        if self.session_list and self.thread_view:
+        if self.session_list is not None and self.thread_view is not None:
             session = self.session_list.get_selected_session()
             if session:
-                self.thread_view.update_session(session, user_only=self.user_only_mode)
+                self._show_session(session)
+
+
+def write_default_config(path: Path = CONFIG_PATH) -> bool:
+    """Write the commented example config. Returns False if one is already there."""
+    if path.exists():
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_config_template(), encoding="utf-8")
+    return True
 
 
 def _find_session_file(session_id: str) -> Optional[Path]:
