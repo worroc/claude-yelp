@@ -541,7 +541,8 @@ class SessionList(ListView):
         super().__init__(*args, **kwargs)
         self.session_manager = session_manager
         self.selected_index = 0
-        self._sessions_to_display: List[Session] = []
+        # None = never populated yet; a list (even empty) = what is on screen
+        self._sessions_to_display: Optional[List[Session]] = None
 
     def on_mount(self):
         """Called when widget is mounted"""
@@ -612,16 +613,18 @@ class SessionList(ListView):
 
     def get_sessions(self) -> List[Session]:
         """Get the list of sessions currently displayed"""
+        return self._displayed_sessions()
+
+    def _displayed_sessions(self) -> List[Session]:
+        """Sessions on screen; falls back to all sessions only before first populate"""
+        if self._sessions_to_display is None:
+            return self.session_manager.sessions
         return self._sessions_to_display
 
     def get_selected_session(self) -> Optional[Session]:
         """Get the currently selected session"""
         idx = self.index if hasattr(self, "index") and self.index is not None else 0
-        sessions = (
-            self._sessions_to_display
-            if self._sessions_to_display
-            else self.session_manager.sessions
-        )
+        sessions = self._displayed_sessions()
         if 0 <= idx < len(sessions):
             return sessions[idx]
         return None
@@ -1057,7 +1060,7 @@ class ClaudeYelpApp(App):
 
     def _apply_pane_widths(self):
         """Apply current pane width settings"""
-        if self.session_list and self.thread_view:
+        if self.session_list is not None and self.thread_view is not None:
             self.session_list.styles.width = f"{self._left_pane_width}%"
             self.thread_view.styles.width = f"{100 - self._left_pane_width}%"
 
@@ -1212,7 +1215,7 @@ class ClaudeYelpApp(App):
 
     def _scroll_to_bottom_fallback(self):
         """Fallback method to scroll to bottom by repeatedly scrolling"""
-        if not self.thread_view:
+        if self.thread_view is None:
             return
         try:
             # Keep scrolling down until we can't scroll anymore
@@ -1253,7 +1256,7 @@ class ClaudeYelpApp(App):
 
     def action_tag_session(self):
         """Tag the current session"""
-        if not self.session_list:
+        if self.session_list is None:
             return
 
         session = self.session_list.get_selected_session()
@@ -1883,7 +1886,7 @@ class ClaudeYelpApp(App):
             # Use multiple callbacks to ensure selection is properly applied
             # after list is fully rendered
             def ensure_selection():
-                if target_index < len(self.session_list._sessions_to_display):
+                if target_index < len(self.session_list._displayed_sessions()):
                     # Ensure list has focus (critical for highlight to show)
                     self.set_focus(self.session_list)
 
@@ -2069,7 +2072,7 @@ class ClaudeYelpApp(App):
         if self.cwd_filter_mode:
             cwd = os.getcwd()
             return [s for s in self.session_manager.sessions if s.project_path == cwd]
-        if self.project_filter_mode and self.session_list:
+        if self.project_filter_mode and self.session_list is not None:
             session = self.session_list.get_selected_session()
             if session:
                 return [
