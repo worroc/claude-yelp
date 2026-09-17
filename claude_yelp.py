@@ -1106,6 +1106,17 @@ def _runs(blocks: List[Dict]):
     return runs
 
 
+def _run_has_work(blocks: List[Dict], first: int, last: int, answer: int) -> bool:
+    """Did the agent do anything in this turn besides write its answer?"""
+    for index in range(first, last + 1):
+        if index == answer:
+            continue
+        block = blocks[index]
+        if block.get("role") in FOLDABLE_ROLES or block.get("content", "").strip():
+            return True
+    return False
+
+
 def _answer_index(blocks: List[Dict], first: int, last: int) -> int:
     """The agent's answer is the last text it wrote in the turn"""
     for index in range(last, first - 1, -1):
@@ -1486,14 +1497,18 @@ class ThreadView(ScrollableContainer):
         # short notes between them. The working part is folded away by default.
         answer = _answer_index(blocks, first, last)
         key = ("turn", first)
-        show_work = (
+        has_work = _run_has_work(blocks, first, last, answer)
+        show_work = has_work and (
             expand_everything
             or key in self.expanded_blocks
             or self._run_holds(blocks, first, last, answer, term)
         )
+        # A turn where the agent only answered hides nothing, so it is not
+        # marked and 'o' has nothing to do there.
+        marker = (FOLD_OPEN if show_work else FOLD_CLOSED) if has_work else ""
 
-        with out.region(key, "turn"):
-            self._add_heading(out, heading, FOLD_OPEN if show_work else FOLD_CLOSED)
+        with out.region(key, "turn" if has_work else "answer"):
+            self._add_heading(out, heading, marker)
 
             pieces = self._run_pieces(
                 blocks, first, last, answer, term, expand_everything, show_work
