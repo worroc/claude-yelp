@@ -118,6 +118,74 @@ class EscapableInput(Input):
             screen.dismiss(None)
 
 
+def _block_search_text(item) -> str:
+    """Flatten one content block into searchable text."""
+    if isinstance(item, str):
+        return item
+    if not isinstance(item, dict):
+        return ""
+
+    block_type = item.get("type")
+    if block_type == "text":
+        return item.get("text", "")
+    if block_type in TOOL_USE_TYPES:
+        name = item.get("name", "")
+        try:
+            args = json.dumps(item.get("input", {}), ensure_ascii=False)
+        except (TypeError, ValueError):
+            args = str(item.get("input", ""))
+        return f"{name} {args}"
+    if block_type in TOOL_RESULT_TYPES:
+        content = item.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return "\n".join(_block_search_text(sub) for sub in content)
+        return ""
+    return ""
+
+
+def _content_block(item, role: str, timestamp) -> Optional[Dict]:
+    """Turn one raw content block into a thread block, or None to skip it."""
+    if not isinstance(item, dict):
+        return None
+
+    block_type = item.get("type")
+    if block_type == "text":
+        return {"role": role, "content": item.get("text", ""), "timestamp": timestamp}
+    if block_type == "thinking":
+        # Claude Code writes the signature but not the text, so most thinking
+        # blocks are empty. An empty one has nothing to show or unfold.
+        thinking = item.get("thinking", "")
+        if not thinking.strip():
+            return None
+        return {
+            "role": "thinking",
+            "name": "thinking",
+            "content": thinking,
+            "timestamp": timestamp,
+        }
+    if block_type in TOOL_USE_TYPES:
+        try:
+            args = json.dumps(item.get("input", {}), indent=2, ensure_ascii=False)
+        except (TypeError, ValueError):
+            args = str(item.get("input", ""))
+        return {
+            "role": "tool_use",
+            "name": item.get("name", "tool"),
+            "content": args,
+            "timestamp": timestamp,
+        }
+    if block_type in TOOL_RESULT_TYPES:
+        return {
+            "role": "tool_result",
+            "name": "result",
+            "content": _block_search_text(item),
+            "timestamp": timestamp,
+        }
+    return None
+
+
 class Session:
     """Represents a Claude session"""
 
@@ -136,6 +204,7 @@ class Session:
         self.timestamp = timestamp
         self.tag: Optional[str] = None
         self._messages: Optional[List[Dict]] = None
+        self._blocks: Optional[List[Dict]] = None
 
     @property
     def display_name(self) -> str:
@@ -185,6 +254,85 @@ class Session:
                 pass
         _debug_log("  Returning 'unknown'")
         return "unknown"
+
+    def matches(self, query_lower: str) -> bool:
+        """Is the query somewhere in this session, tool calls and tool results included?
+
+        The thread view shows only plain user/assistant text, but search must also
+        reach tool inputs and tool outputs. Read as a stream: keeping the full text
+        of every session in memory would cost hundreds of MB.
+        """
+        # A plain query survives JSON encoding unchanged, so the raw line can be
+        # used as a cheap pre-filter. Anything JSON would escape skips that.
+        plain_query = (
+            query_lower.isascii()
+            and query_lower.isprintable()
+            and not set(query_lower) & set('"\\')
+        )
+
+        try:
+            with open(self.file_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if plain_query and query_lower not in line.lower():
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if entry.get("type") not in ("user", "assistant"):
+                        continue
+                    content = entry.get("message", {}).get("content")
+                    if isinstance(content, str):
+                        if query_lower in content.lower():
+                            return True
+                    elif isinstance(content, list):
+                        for item in content:
+                            if query_lower in _block_search_text(item).lower():
+                                return True
+        except Exception as e:
+            _debug_log(f"Failed to search session {self.session_id[:8]}: {e}")
+        return False
+
+    def load_blocks(self) -> List[Dict]:
+        """Messages plus tool calls and tool results, in file order.
+
+        Roles: "user", "assistant", "tool_use", "tool_result". Kept apart from
+        load_messages() so export and copy stay plain conversation text.
+        """
+        if self._blocks is not None:
+            return self._blocks
+
+        blocks = []
+        try:
+            with open(self.file_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    role = entry.get("type")
+                    if role not in ("user", "assistant"):
+                        continue
+                    timestamp = entry.get("timestamp")
+                    content = entry.get("message", {}).get("content")
+                    if isinstance(content, str):
+                        blocks.append({"role": role, "content": content, "timestamp": timestamp})
+                    elif isinstance(content, list):
+                        for item in content:
+                            block = _content_block(item, role, timestamp)
+                            if block:
+                                blocks.append(block)
+        except Exception as e:
+            blocks.append({"role": "error", "content": f"Error loading messages: {e}"})
+
+        self._blocks = blocks
+        return blocks
 
     def load_messages(self) -> List[Dict]:
         """Load messages from the session file"""
@@ -962,7 +1110,8 @@ class ClaudeYelpApp(App):
         self.thread_view: Optional[ThreadView] = None
         self.user_only_mode: bool = False
         self.search_query: str = ""
-        self.filtered_sessions: List[Session] = []
+        # None = no search active; a list (even empty) = search results
+        self.filtered_sessions: Optional[List[Session]] = None
         self.initial_session_number: Optional[int] = initial_session_number
         self._last_g_press: Optional[float] = None  # Track double g press
         # Thread search state
@@ -1658,16 +1807,9 @@ class ClaudeYelpApp(App):
                 matching_sessions.append(session)
                 continue
 
-            # Search in messages content
-            try:
-                messages = session.load_messages()
-                for msg in messages:
-                    content = msg.get("content", "")
-                    if query_lower in content.lower():
-                        matching_sessions.append(session)
-                        break
-            except Exception as e:
-                _debug_log(f"Failed to search session {session.session_id[:8]}: {e}")
+            # Search in the full session text (messages, tool calls, tool results)
+            if session.matches(query_lower):
+                matching_sessions.append(session)
 
         return matching_sessions
 
@@ -1677,60 +1819,89 @@ class ClaudeYelpApp(App):
         if query and query.strip():
             self.filtered_sessions = self._search_sessions(query)
         else:
-            self.filtered_sessions = []
+            self.filtered_sessions = None
 
         # Update session list with filtered results
-        if self.session_list:
-            if self.filtered_sessions:
+        if self.session_list is not None:
+            if self.filtered_sessions is not None:
                 self.session_list._populate(self.filtered_sessions)
             else:
-                self.session_list._populate(self.session_manager.sessions)
+                self.session_list._populate(self._get_filtered_sessions())
 
-            # Select first session if available
-            if self.session_list.index >= len(self.session_list._sessions_to_display):
+            displayed = self.session_list._displayed_sessions()
+            if self.session_list.index is None or self.session_list.index >= len(displayed):
                 self.session_list.index = 0
 
-            # Update thread view
-            session = self.session_list.get_selected_session()
-            if session and self.thread_view:
-                self.thread_view.update_session(session, user_only=self.user_only_mode)
+            # Update thread view; with no results there is nothing to show
+            if self.thread_view is not None:
+                if displayed:
+                    session = self.session_list.get_selected_session()
+                    if session:
+                        self._show_session(session)
+                else:
+                    self.thread_view.clear_content()
+
+    def _thread_has_focus(self) -> bool:
+        """Is the thread pane the active pane?"""
+        focused = self.focused
+        if focused is None or self.thread_view is None:
+            return False
+        return focused is self.thread_view or getattr(focused, "parent", None) is self.thread_view
+
+    def _goto_thread_line(self, number: int):
+        """Put the thread cursor on a line"""
+        if self.thread_view is None:
+            return
+
+        last = self.thread_view.line_count()
+        line = max(1, min(number, last))
+        self.thread_view.set_cursor(line - 1)
+        if line != number:
+            self.notify(
+                f"Thread has {last} lines, stopped at {line}",
+                title="Goto",
+                severity="warning",
+                timeout=2,
+            )
+
+    def _highlight_term(self) -> str:
+        """The term the thread pane should highlight right now"""
+        return self._thread_search_term or self.search_query
+
+    def _current_match_span(self):
+        """Where the match the user is standing on sits in the thread text"""
+        if not self._thread_search_term or not self._thread_search_matches:
+            return None
+        if not 0 <= self._thread_search_index < len(self._thread_search_matches):
+            return None
+        start = self._thread_search_matches[self._thread_search_index]
+        return (start, start + len(self._thread_search_term))
+
+    def _show_session(self, session: Session):
+        """Render a session in the thread pane with the active highlight"""
+        if self.thread_view is None:
+            return
+        self.thread_view.update_session(
+            session,
+            user_only=self.user_only_mode,
+            highlight_term=self._highlight_term(),
+            current_match=self._current_match_span(),
+        )
 
     def _get_thread_raw_text(self) -> str:
-        """Get raw text content of current thread for searching"""
-        if not self.session_list:
+        """Text of the current thread, exactly as the pane shows it"""
+        if self.session_list is None or self.thread_view is None:
             return ""
 
         session = self.session_list.get_selected_session()
         if not session:
             return ""
 
-        messages = session.load_messages()
-
-        # Build plain text content
-        content_parts = []
-        content_parts.append(f"Session: {session.session_id}\n")
-        content_parts.append(f"Project: {session.project_path}\n")
-        content_parts.append(f"Date: {session.date_str}\n")
-        if session.tag:
-            content_parts.append(f"Tag: {session.tag}\n")
-        content_parts.append("\n")
-
-        if messages:
-            i = 0
-            while i < len(messages):
-                current_role = messages[i].get("role", "unknown")
-                combined_texts = [messages[i].get("content", "")]
-
-                j = i + 1
-                while j < len(messages) and messages[j].get("role") == current_role:
-                    combined_texts.append(messages[j].get("content", ""))
-                    j += 1
-
-                combined_text = "\n\n".join(combined_texts)
-                content_parts.append(f"{current_role.title()}:\n{combined_text}\n\n")
-                i = j
-
-        return "".join(content_parts)
+        return self.thread_view.build_text(
+            session,
+            user_only=self.user_only_mode,
+            highlight_term=self._highlight_term(),
+        )
 
     def _search_in_thread(self, query: str):
         """Search for text within the thread content"""
@@ -1855,7 +2026,9 @@ class ClaudeYelpApp(App):
         """Go to session by line number"""
         # Use filtered sessions if search is active, otherwise all sessions
         sessions = (
-            self.filtered_sessions if self.filtered_sessions else self.session_manager.sessions
+            self.filtered_sessions
+            if self.filtered_sessions is not None
+            else self._get_filtered_sessions()
         )
 
         if 1 <= number <= len(sessions):
@@ -1867,18 +2040,20 @@ class ClaudeYelpApp(App):
 
             # Make sure the session list shows the right sessions
             # Pass initial_index to set it during population
-            if self.filtered_sessions:
+            if self.filtered_sessions is not None:
                 self.session_list._populate(
                     self.filtered_sessions, preserve_index=False, initial_index=target_index
                 )
             else:
                 self.session_list._populate(
-                    self.session_manager.sessions, preserve_index=False, initial_index=target_index
+                    self._get_filtered_sessions(),
+                    preserve_index=False,
+                    initial_index=target_index,
                 )
 
             # Update thread view first
-            if self.thread_view:
-                self.thread_view.update_session(target_session, user_only=self.user_only_mode)
+            if self.thread_view is not None:
+                self._show_session(target_session)
 
             # Focus the session list immediately so highlight will be visible
             self.set_focus(self.session_list)
@@ -1959,29 +2134,27 @@ class ClaudeYelpApp(App):
                 # User pressed ESC - do nothing
                 return
 
-            # Check which pane is focused to determine search behavior
-            focused = self.focused
-            is_thread_focused = focused == self.thread_view or (
-                focused and hasattr(focused, "parent") and focused.parent == self.thread_view
-            )
-
             if is_thread_focused and value:
                 # Search within thread content
                 self._search_in_thread(value)
             elif value:
                 # Filter sessions list
                 self._apply_search_filter(value)
-                result_count = (
-                    len(self.filtered_sessions)
-                    if self.filtered_sessions
-                    else len(self.session_manager.sessions)
-                )
-                self.notify(
-                    f"Search: {value} ({result_count} results)",
-                    title="Search",
-                    severity="information",
-                    timeout=2,
-                )
+                result_count = len(self.filtered_sessions or [])
+                if result_count:
+                    self.notify(
+                        f"Search: {value} ({result_count} results)",
+                        title="Search",
+                        severity="information",
+                        timeout=2,
+                    )
+                else:
+                    self.notify(
+                        f"No sessions match: {value}",
+                        title="Search",
+                        severity="warning",
+                        timeout=3,
+                    )
             else:
                 # Empty search clears filter
                 self._apply_search_filter("")
@@ -2096,8 +2269,12 @@ class ClaudeYelpApp(App):
 
     def _apply_directory_filter(self):
         """Repopulate session list based on current filter state"""
-        if not self.session_list:
+        if self.session_list is None:
             return
+
+        # Changing the directory filter starts a fresh view, so drop any search
+        self.search_query = ""
+        self.filtered_sessions = None
 
         if self.cwd_filter_mode:
             cwd = os.getcwd()
