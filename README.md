@@ -20,7 +20,7 @@ Claude Yelp provides a TUI (Text User Interface) for managing Claude Code CLI se
 - **Delete sessions**: Remove sessions with confirmation dialog
 - **User-only mode**: Toggle to show only user messages in the thread view
 - **Two thread views**: by default only what the agent answered; `m` also shows its notes and one line per chain of thinking and tool calls
-- **Thread cursor**: A marker shows the current line; folding keys act on the chain or block it sits in
+- **Thread cursor**: A lit gutter shows the current line; `o` opens what it sits on
 - **Resizable panels**: Adjust panel widths with keyboard shortcuts
 - **Vim-style navigation**: `gg`, `G`, `/`, `n`, `N`, `:` command mode
 - **Temporary sessions**: Create sessions that are auto-deleted on exit (`-t` flag)
@@ -68,8 +68,7 @@ These are the defaults. See [Configuration](#configuration) to change them.
 |-----|--------|
 | `m` | Show/hide how the agent worked (mind view) |
 | `u` | Toggle user-only message filter |
-| `i` | Open/close the chain of steps the thread cursor is on |
-| `o` | Open/close the single tool step the thread cursor is on |
+| `o` | Open/close what the thread cursor is on: a chain, or one step inside it |
 | `Escape` | Cancel/close modal |
 | `q` | Quit |
 

@@ -64,9 +64,9 @@ FOLDABLE_ROLES = frozenset({"thinking", "tool_use", "tool_result"})
 FOLDABLE_ICONS = {"thinking": "💭", "tool_use": "⚙", "tool_result": "↩"}
 FOLDABLE_STYLES = {"thinking": "italic magenta", "tool_use": "blue", "tool_result": "dim"}
 
-# Which blocks each fold key acts on
-CHAIN_FOLD_ROLES = frozenset({"chain"})
-TOOL_FOLD_ROLES = frozenset({"tool_use", "tool_result", "thinking"})
+# What the fold key acts on. Regions nest, so the cursor is either on a chain's
+# own line or on one step inside it, and the innermost one wins.
+FOLD_ROLES = frozenset({"chain", "tool_use", "tool_result", "thinking"})
 # The match the user is standing on, against the other matches
 CURRENT_MATCH_STYLE = "bold black on bright_yellow"
 # How much of a collapsed tool block is shown on its one line
@@ -120,8 +120,7 @@ KEYMAP = (
         (
             ("toggle_chain", ("m",), "Show how the agent worked (mind)"),
             ("toggle_user_only", ("u",), "Show only user messages"),
-            ("toggle_chain_block", ("i",), "Open/close the chain at the cursor"),
-            ("toggle_tool_output", ("o",), "Open/close the tool step at the cursor"),
+            ("toggle_tool_output", ("o",), "Open/close the chain or step at the cursor"),
             ("copy_thread", ("c",), "Copy thread as markdown"),
             ("yank", ("y",), "Yank selected text"),
         ),
@@ -309,8 +308,8 @@ def build_help_text(bindings: List[Binding]) -> str:
     lines.append("[b]Notes[/b]")
     lines.append("  The thread shows what the agent answered. 'm' also shows how it")
     lines.append("  worked: its notes, and one line per chain of thinking and tools.")
-    lines.append("  A marker (▌) shows the line the cursor is on. Folding keys act on")
-    lines.append("  the chain or block the cursor sits in.")
+    lines.append("  A lit gutter shows the line the cursor is on. 'o' opens what the")
+    lines.append("  cursor sits on: a chain, or one step inside an open chain.")
     lines.append("  Command mode takes a number (session, or thread line when the")
     lines.append("  thread has focus) or: export, export full, show-thinking, quit.")
     lines.append("  TAB completes.")
@@ -2470,13 +2469,9 @@ class ClaudeYelpApp(App):
             f"Agent's working steps {state}", title="Thread", severity="information", timeout=2
         )
 
-    def action_toggle_chain_block(self):
-        """Open or close the chain of steps the cursor sits in"""
-        self._toggle_block(CHAIN_FOLD_ROLES, "chain")
-
     def action_toggle_tool_output(self):
-        """Open or close the single tool step the cursor sits in"""
-        self._toggle_block(TOOL_FOLD_ROLES, "tool step")
+        """Open or close the chain or the single step the cursor sits in"""
+        self._toggle_block(FOLD_ROLES, "chain or step")
 
     def _toggle_block(self, roles, what: str):
         """Fold or unfold the block under the thread cursor"""
