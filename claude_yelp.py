@@ -328,6 +328,8 @@ APP_HELP_TEXT = build_help_text(APP_BINDINGS)
 # The help screen closes with whatever keys open it or cancel elsewhere
 HELP_CLOSE_KEYS = keys_for_action(APP_BINDINGS, "show_help", "escape", "quit")
 
+__version__ = "0.1.0"
+
 DEBUG_LOG_FILE = os.path.join(tempfile.gettempdir(), "claude-yelp-debug.log")
 DEBUG_ENABLED = False
 
@@ -1769,6 +1771,7 @@ class ClaudeYelpApp(App):
     """Main application"""
 
     ALLOW_SELECT = True
+    TITLE = f"Claude Yelp {__version__}"
 
     CSS = """
     Screen {
@@ -3235,6 +3238,9 @@ def main():
     parser = argparse.ArgumentParser(
         description="Claude Yelp - Session manager for Claude CLI",
         epilog="Examples: clod, clod +10, clod 'my-tag', clod -t 'temp-tag', clod -d abc12345",
+    )
+    parser.add_argument(
+        "--version", action="version", version=__version__, help="Print the version and exit"
     )
     parser.add_argument(
         "--debug", action="store_true", help="Enable debug logging to /tmp/claude-yelp-debug.log"

@@ -154,8 +154,24 @@ clod -t scratch   # Create a temporary session (deleted on exit)
 ```bash
 clod --debug          # Enable debug logging to /tmp/claude-yelp-debug.log
 clod --write-config   # Create ~/.config/claude-yelp/config
+clod --version        # Print the version and exit
 clod --help           # Show help
 ```
+
+### Version
+
+The version is shown in the title bar and printed by `clod --version`.
+It lives in one place per file and is raised with
+[bump2version](https://github.com/c4urself/bump2version):
+
+```bash
+bump2version patch    # 0.1.0 -> 0.1.1
+bump2version minor    # 0.1.0 -> 0.2.0
+bump2version major    # 0.1.0 -> 1.0.0
+```
+
+That updates `pyproject.toml`, `claude_yelp.py` and `.bumpversion.cfg`,
+commits the change and tags it.
 
 ## Project Structure
 
