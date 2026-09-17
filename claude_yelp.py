@@ -16,10 +16,314 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from textual.app import App, ComposeResult
+from rich.console import Console as RichConsole
+from rich.text import Text as RichText
+from textual import keys as textual_keys
 from textual.binding import Binding
 from textual.containers import Horizontal, ScrollableContainer, Vertical
+from textual.keys import format_key
 from textual.screen import ModalScreen
 from textual.widgets import Footer, Header, Input, ListItem, ListView, Static
+
+# Raw content-block types that carry tool calls and their output
+TOOL_USE_TYPES = frozenset({"tool_use", "server_tool_use"})
+TOOL_RESULT_TYPES = frozenset({"tool_result", "server_tool_result", "advisor_tool_result"})
+# The left column that carries the cursor mark
+GUTTER_BLANK = "  "
+CURSOR_STYLE = "on yellow"
+# Lines of context kept around the cursor when it moves
+CURSOR_MARGIN = 3
+# Heading rules are a fixed length, so resizing never shifts the text
+HEADING_WIDTH = 34
+# One line standing for a run of thinking and tool steps
+CHAIN_ICON = "⚙"
+CHAIN_STYLE = "dim cyan"
+CHAIN_NAMES_SHOWN = 3
+# A short note the agent wrote between steps
+NOTE_STYLE = "dim italic"
+# An agent turn that produced no text at all
+WORKED_SILENTLY = "⚙ worked without answering (press m)"
+
+# One heading per speaker; everything the agent does sits under the agent
+ROLE_HEADINGS = {
+    "user": "👤 User",
+    "assistant": "🤖 Assistant",
+    "thinking": "🤖 Assistant",
+    "tool_use": "🤖 Assistant",
+    "tool_result": "🤖 Assistant",
+    "error": "❌ Error",
+}
+ROLE_STYLES = {
+    "👤 User": "bold green",
+    "🤖 Assistant": "bold cyan",
+    "❌ Error": "bold red",
+}
+# Blocks shown as one line until they are opened
+FOLDABLE_ROLES = frozenset({"thinking", "tool_use", "tool_result"})
+FOLDABLE_ICONS = {"thinking": "💭", "tool_use": "⚙", "tool_result": "↩"}
+FOLDABLE_STYLES = {"thinking": "italic magenta", "tool_use": "blue", "tool_result": "dim"}
+
+# Which blocks each fold key acts on
+CHAIN_FOLD_ROLES = frozenset({"chain"})
+TOOL_FOLD_ROLES = frozenset({"tool_use", "tool_result", "thinking"})
+# The match the user is standing on, against the other matches
+CURRENT_MATCH_STYLE = "bold black on bright_yellow"
+# How much of a collapsed tool block is shown on its one line
+TOOL_PREVIEW_CHARS = 80
+
+CONFIG_PATH = Path(
+    os.environ.get("CLAUDE_YELP_CONFIG", Path.home() / ".config" / "claude-yelp" / "config")
+)
+
+# The one place shortcuts are defined: section, action, default keys, description.
+# The key bindings, the help screen and the config file all come from this table.
+KEYMAP = (
+    (
+        "Navigation",
+        (
+            ("move_up", ("up",), "Move up / scroll thread up"),
+            ("move_down", ("down",), "Move down / scroll thread down"),
+            ("page_up", ("pageup",), "Page up"),
+            ("page_down", ("pagedown",), "Page down"),
+            ("go_to_top", ("g",), "Go to top (press twice)"),
+            ("go_to_bottom", ("G",), "Go to bottom"),
+            ("focus_left", ("left",), "Focus session list"),
+            ("focus_right", ("right",), "Focus thread"),
+            ("resize_left", ("shift+left",), "Make session list narrower"),
+            ("resize_right", ("shift+right",), "Make session list wider"),
+        ),
+    ),
+    (
+        "Sessions",
+        (
+            ("copy_session_command", ("r",), "Resume selected session"),
+            ("tag_session", ("t", "f2"), "Tag session"),
+            ("delete_session", ("d",), "Delete session"),
+            ("export_session", ("e",), "Export session to markdown"),
+            ("new_session", ("ctrl+n",), "Create new tagged session"),
+            ("toggle_cwd_filter", (".",), "Toggle CWD filter (on by default)"),
+            ("toggle_project_filter", (",",), "Toggle selected project filter"),
+        ),
+    ),
+    (
+        "Search",
+        (
+            ("search_mode", ("/",), "Search sessions (left) or thread (right)"),
+            ("search_next", ("n",), "Next match"),
+            ("search_prev", ("N", "p"), "Previous match"),
+            ("command_mode", (":",), "Command mode (number jumps to session)"),
+        ),
+    ),
+    (
+        "Thread",
+        (
+            ("toggle_chain", ("m",), "Show how the agent worked (mind)"),
+            ("toggle_user_only", ("u",), "Show only user messages"),
+            ("toggle_chain_block", ("i",), "Open/close the chain at the cursor"),
+            ("toggle_tool_output", ("o",), "Open/close the tool step at the cursor"),
+            ("copy_thread", ("c",), "Copy thread as markdown"),
+            ("yank", ("y",), "Yank selected text"),
+        ),
+    ),
+    (
+        "General",
+        (
+            ("show_help", ("ctrl+k",), "Toggle this help"),
+            ("escape", ("escape",), "Cancel / close dialog"),
+            ("quit", ("q",), "Quit"),
+        ),
+    ),
+)
+
+# Actions kept out of the footer, so it stays readable
+FOOTER_ACTIONS = frozenset({"new_session", "copy_session_command", "show_help", "escape", "quit"})
+
+CONFIG_TEMPLATE = """\
+# claude-yelp configuration
+#
+# One shortcut per line:
+#
+#     keybind = <key>=<action>
+#
+# The key replaces nothing else: the default key for that action still works
+# until you unbind it.
+#
+#     keybind = ctrl+f=search_mode      # ctrl+f also opens search
+#     keybind = /=unbind                # '/' stops opening search
+#
+# Keys are written the way you press them: a, G, ctrl+n, shift+left, f2,
+# pageup, escape, '.', ',', '/'.
+#
+# Actions:
+{actions}
+"""
+
+
+def _config_template() -> str:
+    """The commented example config, listing every action and its default keys"""
+    lines = []
+    for section, entries in KEYMAP:
+        lines.append(f"#   {section}")
+        for action, keys, description in entries:
+            shown = " ".join(keys)
+            lines.append(f"#     {action:<22} {shown:<14} {description}")
+    return CONFIG_TEMPLATE.format(actions="\n".join(lines))
+
+
+def _normalize_key(key: str) -> str:
+    """Turn a key as the user writes it into the name Textual expects"""
+    key = key.strip()
+    if len(key) == 1:
+        try:
+            return textual_keys._character_to_key(key)
+        except Exception:
+            return key
+    return key
+
+
+def read_key_config(path: Path = CONFIG_PATH):
+    """Read the config file.
+
+    Returns (bindings, problems): bindings maps a normalized key to an action
+    name, or to None when the line unbinds it. Problems are human-readable
+    strings; the app shows them instead of failing, so one bad line never
+    stops the tool from starting.
+    """
+    bindings = {}
+    problems = []
+
+    if not path.exists():
+        return bindings, problems
+
+    known_actions = {action for _, entries in KEYMAP for action, _, _ in entries}
+
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as e:
+        return bindings, [f"cannot read {path}: {e}"]
+
+    for number, raw in enumerate(text.splitlines(), start=1):
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+
+        name, _, value = line.partition("=")
+        if name.strip() != "keybind" or not value.strip():
+            problems.append(f"line {number}: expected 'keybind = <key>=<action>'")
+            continue
+
+        key, _, action = value.partition("=")
+        key, action = _normalize_key(key), action.strip()
+        if not key or not action:
+            problems.append(f"line {number}: expected 'keybind = <key>=<action>'")
+            continue
+
+        if action == "unbind":
+            bindings[key] = None
+        elif action in known_actions:
+            bindings[key] = action
+        else:
+            problems.append(f"line {number}: unknown action '{action}'")
+
+    return bindings, problems
+
+
+def build_bindings(config=None) -> List[Binding]:
+    """Default shortcuts, with the config file layered on top"""
+    config = config or {}
+    keys_for = {}
+
+    for _, entries in KEYMAP:
+        for action, keys, description in entries:
+            keys_for[action] = [_normalize_key(k) for k in keys]
+
+    # A key named in the config belongs to that action only
+    for key, action in config.items():
+        for keys in keys_for.values():
+            if key in keys:
+                keys.remove(key)
+        if action is not None:
+            keys_for[action].append(key)
+
+    bindings = []
+    for _, entries in KEYMAP:
+        for action, _, description in entries:
+            for key in keys_for[action]:
+                bindings.append(
+                    Binding(
+                        key,
+                        action,
+                        description,
+                        show=action in FOOTER_ACTIONS,
+                        priority=True,
+                    )
+                )
+    return bindings
+
+
+QUIT_COMMANDS = frozenset({"q", "q!", "quit", "exit"})
+# What TAB offers after ':'
+COMMANDS = ("export", "export full", "show-thinking", "quit")
+
+
+def complete_command(typed: str):
+    """Finish a command name from what is typed. Returns (text, hint)."""
+    prefix = typed.lstrip()
+    if not prefix:
+        return typed, "  ".join(COMMANDS)
+
+    matches = [c for c in COMMANDS if c.startswith(prefix)]
+    if not matches:
+        return typed, None
+    if len(matches) == 1:
+        return matches[0], None
+
+    # Fill in as far as every match agrees
+    shared = matches[0]
+    for candidate in matches[1:]:
+        while not candidate.startswith(shared):
+            shared = shared[:-1]
+    return shared, "  ".join(matches)
+
+
+def keys_for_action(bindings: List[Binding], *actions: str) -> frozenset:
+    """Every key currently bound to any of these actions"""
+    return frozenset(b.key for b in bindings if b.action in actions)
+
+
+def build_help_text(bindings: List[Binding]) -> str:
+    """Help screen text, built from the shortcuts that are actually active"""
+    keys_for = {}
+    for binding in bindings:
+        keys_for.setdefault(binding.action, []).append(format_key(binding.key))
+
+    lines = []
+    for section, entries in KEYMAP:
+        lines.append(f"[b]{section}[/b]")
+        for action, _, description in entries:
+            keys = " / ".join(keys_for.get(action, [])) or "(unbound)"
+            lines.append(f"  {keys:<20} {description}")
+        lines.append("")
+
+    lines.append("[b]Notes[/b]")
+    lines.append("  The thread shows what the agent answered. 'm' also shows how it")
+    lines.append("  worked: its notes, and one line per chain of thinking and tools.")
+    lines.append("  A marker (▌) shows the line the cursor is on. Folding keys act on")
+    lines.append("  the chain or block the cursor sits in.")
+    lines.append("  Command mode takes a number (session, or thread line when the")
+    lines.append("  thread has focus) or: export, export full, show-thinking, quit.")
+    lines.append("  TAB completes.")
+    lines.append(f"  Shortcuts can be changed in {CONFIG_PATH}")
+    lines.append("  Run 'clod --write-config' to create it with every action listed.")
+    return "\n".join(lines)
+
+
+# Textual reads BINDINGS when the class is created, so the config is loaded here
+KEY_CONFIG, KEY_CONFIG_PROBLEMS = read_key_config()
+APP_BINDINGS = build_bindings(KEY_CONFIG)
+APP_HELP_TEXT = build_help_text(APP_BINDINGS)
+# The help screen closes with whatever keys open it or cancel elsewhere
+HELP_CLOSE_KEYS = keys_for_action(APP_BINDINGS, "show_help", "escape", "quit")
 
 DEBUG_LOG_FILE = os.path.join(tempfile.gettempdir(), "claude-yelp-debug.log")
 DEBUG_ENABLED = False
@@ -994,7 +1298,7 @@ class HelpScreen(ModalScreen):
             container.scroll_page_up(animate=False)
         elif key == "pagedown":
             container.scroll_page_down(animate=False)
-        elif key in ("escape", "q", "ctrl+k"):
+        elif key in HELP_CLOSE_KEYS:
             self.dismiss()
         # Stop all keys from reaching the app
         event.stop()
@@ -1060,38 +1364,8 @@ class ClaudeYelpApp(App):
     }
     """
 
-    BINDINGS = [
-        # Shown in footer bar
-        Binding("ctrl+n", "new_session", "New Session", priority=True),
-        Binding("r", "copy_session_command", "Resume Session", priority=True),
-        Binding("ctrl+k", "show_help", "Shortcuts", priority=True),
-        # Hidden from footer, available via Ctrl+K help and Ctrl+P palette
-        Binding("left", "focus_left", "Focus Left Panel", show=False, priority=True),
-        Binding("right", "focus_right", "Focus Right Panel", show=False, priority=True),
-        Binding("shift+left", "resize_left", "Resize Left", show=False, priority=True),
-        Binding("shift+right", "resize_right", "Resize Right", show=False, priority=True),
-        Binding("up", "move_up", "Move Up", show=False, priority=True),
-        Binding("down", "move_down", "Move Down", show=False, priority=True),
-        Binding("pageup", "page_up", "Page Up", show=False, priority=True),
-        Binding("pagedown", "page_down", "Page Down", show=False, priority=True),
-        Binding("t", "tag_session", "Tag Session", show=False, priority=True),
-        Binding("f2", "tag_session", "Tag Session", show=False, priority=True),
-        Binding("e", "export_session", "Export Session", show=False, priority=True),
-        Binding("d", "delete_session", "Delete Session", show=False, priority=True),
-        Binding("u", "toggle_user_only", "Toggle User Only", show=False, priority=True),
-        Binding("c", "copy_thread", "Copy Thread", show=False, priority=True),
-        Binding("y", "yank", "Yank Selection", show=False, priority=True),
-        Binding(":", "command_mode", "Command Mode", show=False, priority=True),
-        Binding("/", "search_mode", "Search Mode", show=False, priority=True),
-        Binding("n", "search_next", "Next Match", show=False, priority=True),
-        Binding("N", "search_prev", "Previous Match", show=False, priority=True),
-        Binding("escape", "escape", "Cancel/Close", priority=True),
-        Binding("q", "quit", "Quit", priority=True),
-        Binding("g", "go_to_top", "Go to Top", show=False, priority=True),
-        Binding("G", "go_to_bottom", "Go to Bottom", show=False, priority=True),
-        Binding("full_stop", "toggle_cwd_filter", "CWD Filter", show=False, priority=True),
-        Binding("comma", "toggle_project_filter", "Project Filter", show=False, priority=True),
-    ]
+    BINDINGS = APP_BINDINGS
+
 
     def check_action(self, action: str, parameters) -> bool | None:
         """Disable app actions when a modal is active."""
@@ -1144,6 +1418,14 @@ class ClaudeYelpApp(App):
 
         # Set initial focus to session list
         self.set_focus(self.session_list)
+
+        if KEY_CONFIG_PROBLEMS:
+            self.notify(
+                "\n".join(KEY_CONFIG_PROBLEMS),
+                title=f"Config: {CONFIG_PATH}",
+                severity="warning",
+                timeout=8,
+            )
 
         # Apply default CWD filter
         if self.cwd_filter_mode:
@@ -2110,14 +2392,17 @@ class ClaudeYelpApp(App):
 
     def action_search_mode(self):
         """Enter search mode"""
-        if not self.session_list:
+        if self.session_list is None:
             return
+
+        is_thread_focused = self._thread_has_focus()
+        where = "thread" if is_thread_focused else "sessions"
 
         # Use modal screen like tag input
         class SearchInputScreen(ModalScreen):
             def compose(self):
                 yield EscapableInput(
-                    placeholder="Search sessions... (ESC to cancel)", id="search-input"
+                    placeholder=f"Search {where}... (ESC to cancel)", id="search-input"
                 )
 
             def on_mount(self):
@@ -2165,14 +2450,20 @@ class ClaudeYelpApp(App):
 
     def action_command_mode(self):
         """Enter command mode"""
-        if not self.session_list:
+        if self.session_list is None:
             return
+
+        # The pane that has focus decides what a number means, and focus can
+        # move while the modal is open, so it is read now.
+        is_thread_focused = self._thread_has_focus()
+        target = "line in thread" if is_thread_focused else "session"
+        app = self
 
         # Use modal screen like tag input
         class CommandInputScreen(ModalScreen):
             def compose(self):
                 yield EscapableInput(
-                    placeholder="Enter command (number to goto session)... (ESC to cancel)",
+                    placeholder=f"Number to goto {target}, or a command... (TAB completes)",
                     id="command-input",
                 )
 
@@ -2180,6 +2471,21 @@ class ClaudeYelpApp(App):
                 """Focus the input when mounted"""
                 input_widget = self.query_one("#command-input", EscapableInput)
                 input_widget.focus()
+
+            def on_key(self, event) -> None:
+                """TAB completes the command being typed"""
+                if event.key != "tab":
+                    return
+                event.stop()
+                event.prevent_default()
+
+                widget = self.query_one("#command-input", EscapableInput)
+                completion, hint = complete_command(widget.value)
+                if completion != widget.value:
+                    widget.value = completion
+                    widget.cursor_position = len(completion)
+                if hint:
+                    app.notify(hint, title="Commands", severity="information", timeout=3)
 
             def on_input_submitted(self, event: Input.Submitted):
                 value = event.value.strip()
@@ -2190,15 +2496,40 @@ class ClaudeYelpApp(App):
                 # User pressed ESC - do nothing
                 return
             if value:
-                try:
-                    number = int(value.strip())
-                    self._goto_session(number)
-                except ValueError:
-                    self.notify(
-                        f"Unknown command: {value}", title="Error", severity="error", timeout=3
-                    )
+                self._run_command(value, is_thread_focused)
 
         self.push_screen(CommandInputScreen(), handle_command)
+
+    def _run_command(self, value: str, is_thread_focused: bool):
+        """Act on what was typed after ':'"""
+        command = value.strip().lower()
+
+        if command in QUIT_COMMANDS:
+            self.exit()
+            return
+
+        if command in ("export", "e"):
+            self.action_export_session()
+            return
+
+        if command in ("export full", "export-full", "ef"):
+            self.action_export_session(full=True)
+            return
+
+        if command in ("show-thinking", "mind", "m"):
+            self.action_toggle_chain()
+            return
+
+        try:
+            number = int(command)
+        except ValueError:
+            self.notify(f"Unknown command: {value}", title="Error", severity="error", timeout=3)
+            return
+
+        if is_thread_focused:
+            self._goto_thread_line(number)
+        else:
+            self._goto_session(number)
 
     def action_show_help(self):
         """Toggle keyboard shortcuts help screen"""
@@ -2454,6 +2785,11 @@ def main():
         "-d", "--delete", metavar="SESSION_ID", help="Delete a session by ID (supports partial match)"
     )
     parser.add_argument(
+        "--write-config",
+        action="store_true",
+        help=f"Write an example shortcut config to {CONFIG_PATH}",
+    )
+    parser.add_argument(
         "-t", "--temp", action="store_true", help="Temporary session (deleted on exit)"
     )
     parser.add_argument(
@@ -2469,6 +2805,16 @@ def main():
             source = "--debug flag" if args.debug else "CLAUDE_YELP_DEBUG env"
             f.write(f"=== claude-yelp started at {datetime.now().isoformat()} ({source}) ===\n")
         _debug_log("Debug logging enabled")
+
+    if args.write_config:
+        if write_default_config():
+            print(f"Wrote {CONFIG_PATH}")
+        else:
+            print(f"{CONFIG_PATH} already exists, left as is")
+        sys.exit(0)
+
+    for problem in KEY_CONFIG_PROBLEMS:
+        print(f"config: {problem}", file=sys.stderr)
 
     if args.delete:
         sm = SessionManager()

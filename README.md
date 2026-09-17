@@ -116,8 +116,9 @@ clod -t scratch   # Create a temporary session (deleted on exit)
 ### Other options
 
 ```bash
-clod --debug      # Enable debug logging to /tmp/claude-yelp-debug.log
-clod --help       # Show help
+clod --debug          # Enable debug logging to /tmp/claude-yelp-debug.log
+clod --write-config   # Create ~/.config/claude-yelp/config
+clod --help           # Show help
 ```
 
 ## Project Structure
