@@ -32,6 +32,10 @@ TOOL_RESULT_TYPES = frozenset({"tool_result", "server_tool_result", "advisor_too
 # The left column that carries the cursor mark
 GUTTER_BLANK = "  "
 CURSOR_STYLE = "on yellow"
+# What a line that can be opened looks like in the gutter
+FOLD_CLOSED = "▸ "
+FOLD_OPEN = "▾ "
+FOLD_STYLE = "bold yellow"
 # Lines of context kept around the cursor when it moves
 CURSOR_MARGIN = 3
 # Heading rules are a fixed length, so resizing never shifts the text
@@ -43,7 +47,7 @@ CHAIN_NAMES_SHOWN = 3
 # A short note the agent wrote between steps
 NOTE_STYLE = "dim italic"
 # An agent turn that produced no text at all
-WORKED_SILENTLY = "⚙ worked without answering (press m)"
+WORKED_SILENTLY = "(worked without answering)"
 
 # One heading per speaker; everything the agent does sits under the agent
 ROLE_HEADINGS = {
@@ -66,7 +70,7 @@ FOLDABLE_STYLES = {"thinking": "italic magenta", "tool_use": "blue", "tool_resul
 
 # What the fold key acts on. Regions nest, so the cursor is either on a chain's
 # own line or on one step inside it, and the innermost one wins.
-FOLD_ROLES = frozenset({"chain", "tool_use", "tool_result", "thinking"})
+FOLD_ROLES = frozenset({"turn", "chain", "tool_use", "tool_result", "thinking"})
 # The match the user is standing on, against the other matches
 CURRENT_MATCH_STYLE = "bold black on bright_yellow"
 # How much of a collapsed tool block is shown on its one line
@@ -118,7 +122,6 @@ KEYMAP = (
     (
         "Thread",
         (
-            ("toggle_chain", ("m",), "Show how the agent worked (mind)"),
             ("toggle_user_only", ("u",), "Show only user messages"),
             ("toggle_tool_output", ("o",), "Open/close the chain or step at the cursor"),
             ("copy_thread", ("c",), "Copy thread as markdown"),
@@ -263,7 +266,7 @@ def build_bindings(config=None) -> List[Binding]:
 
 QUIT_COMMANDS = frozenset({"q", "q!", "quit", "exit"})
 # What TAB offers after ':'
-COMMANDS = ("export", "export full", "show-thinking", "quit")
+COMMANDS = ("export", "export full", "quit")
 
 
 def complete_command(typed: str):
@@ -306,13 +309,13 @@ def build_help_text(bindings: List[Binding]) -> str:
         lines.append("")
 
     lines.append("[b]Notes[/b]")
-    lines.append("  The thread shows what the agent answered. 'm' also shows how it")
-    lines.append("  worked: its notes, and one line per chain of thinking and tools.")
-    lines.append("  A lit gutter shows the line the cursor is on. 'o' opens what the")
-    lines.append("  cursor sits on: a chain, or one step inside an open chain.")
+    lines.append("  The thread shows what the agent answered; open a turn to see how")
+    lines.append("  it worked: its notes, and one line per chain of tool steps.")
+    lines.append("  A ▸ in the left column marks a line that opens. 'o' opens the one")
+    lines.append("  the cursor is on: an agent turn, then a chain, then one step.")
+    lines.append("  A lit column shows where the cursor is.")
     lines.append("  Command mode takes a number (session, or thread line when the")
-    lines.append("  thread has focus) or: export, export full, show-thinking, quit.")
-    lines.append("  TAB completes.")
+    lines.append("  thread has focus) or: export, export full, quit. TAB completes.")
     lines.append(f"  Shortcuts can be changed in {CONFIG_PATH}")
     lines.append("  Run 'clod --write-config' to create it with every action listed.")
     return "\n".join(lines)
@@ -1135,12 +1138,16 @@ class ThreadBuilder:
         self.plain.append(text)
         self.chars += len(text)
 
-    def add_lines(self, text: str, style: str = ""):
-        """Add text line by line, each line starting after the cursor gutter"""
-        for line in text.split("\n"):
+    def add_lines(self, text: str, style: str = "", marker: str = ""):
+        """Add text line by line.
+
+        The gutter is two columns wide. It carries the fold marker of the first
+        line, and it is the strip that lights up under the cursor.
+        """
+        for offset, line in enumerate(text.split("\n")):
             self.line_offsets.append(self.chars)
             if self.gutter:
-                self._add(GUTTER_BLANK)
+                self._add(marker if (marker and offset == 0) else GUTTER_BLANK, FOLD_STYLE)
             self._add(line, style)
             self._add("\n")
             self.line += 1
@@ -1188,8 +1195,6 @@ class ThreadView(ScrollableContainer):
         self.session_manager = session_manager
         self.current_session: Optional[Session] = None
         self._pending_update: Optional[Session] = None
-        # Off by default: only what the agent said, not how it got there
-        self.show_chain: bool = False
         # Blocks opened one at a time from the cursor
         self.expanded_blocks = set()
         self.cursor_line: int = 0
@@ -1304,23 +1309,26 @@ class ThreadView(ScrollableContainer):
         elif row > top + height - 1 - margin:
             self.scroll_to(0, max(0, row - height + 1 + margin), animate=False)
 
-    def cursor_block(self):
+    def cursor_block(self, roles=None):
         """(fold key, role) the cursor sits in, or None.
 
-        Regions nest: a chain that is open lists its steps inside it, so the
-        innermost region wins.
+        Regions nest: a turn holds its chains, an open chain holds its steps.
+        The innermost one wins, so 'o' always acts on the nearest thing.
         """
         found = None
         for first, last, key, role in self.block_regions:
-            if first <= self.cursor_line <= last:
-                if found is None or (last - first) <= (found[1] - found[0]):
-                    found = (first, last, key, role)
+            if not (first <= self.cursor_line <= last):
+                continue
+            if roles is not None and role not in roles:
+                continue
+            if found is None or (last - first) <= (found[1] - found[0]):
+                found = (first, last, key, role)
         return (found[2], found[3]) if found else None
 
     def toggle_cursor_block(self, roles) -> Optional[str]:
-        """Open or close the block under the cursor. Says what happened."""
-        found = self.cursor_block()
-        if found is None or found[1] not in roles:
+        """Open or close the nearest foldable line under the cursor"""
+        found = self.cursor_block(roles)
+        if found is None:
             return None
 
         key = found[0]
@@ -1383,7 +1391,6 @@ class ThreadView(ScrollableContainer):
             user_only,
             highlight_term,
             current_match,
-            self.show_chain,
             frozenset(self.expanded_blocks),
             self.cursor_line,
         )
@@ -1476,23 +1483,42 @@ class ThreadView(ScrollableContainer):
 
         # The agent's turn. Its answer is the last thing it wrote; everything
         # before that is working: thinking, tool calls, tool results and the
-        # short notes between them.
+        # short notes between them. The working part is folded away by default.
         answer = _answer_index(blocks, first, last)
-        pieces = self._run_pieces(blocks, first, last, answer, term, expand_everything)
+        key = ("turn", first)
+        show_work = (
+            expand_everything
+            or key in self.expanded_blocks
+            or self._run_holds(blocks, first, last, answer, term)
+        )
 
-        self._add_heading(out, heading)
-        if not pieces:
-            # The agent worked but wrote nothing. Without this line the two user
-            # messages around it would run together.
-            with out.region(("chain", first), "chain"):
+        with out.region(key, "turn"):
+            self._add_heading(out, heading, FOLD_OPEN if show_work else FOLD_CLOSED)
+
+            pieces = self._run_pieces(
+                blocks, first, last, answer, term, expand_everything, show_work
+            )
+            if not pieces:
+                # The agent worked but wrote nothing. Without this line the two
+                # user messages around it would run together.
                 out.add_lines(WORKED_SILENTLY, CHAIN_STYLE)
-            out.add_lines("")
-            return
+                out.add_lines("")
+                return
 
-        for piece in pieces:
-            piece(out)
+            for piece in pieces:
+                piece(out)
 
-    def _run_pieces(self, blocks, first, last, answer, term, expand_everything):
+    def _run_holds(self, blocks, first, last, answer, term) -> bool:
+        """Is the search term hiding in the working part of this turn?"""
+        if not term:
+            return False
+        return any(
+            term in blocks[i].get("content", "").lower()
+            for i in range(first, last + 1)
+            if i != answer
+        )
+
+    def _run_pieces(self, blocks, first, last, answer, term, expand_everything, show_work):
         """What of the agent's turn is worth drawing, in order"""
         pieces = []
         index = first
@@ -1508,23 +1534,25 @@ class ThreadView(ScrollableContainer):
                 stop = index
                 while stop + 1 <= last and blocks[stop + 1].get("role") in FOLDABLE_ROLES:
                     stop += 1
-                piece = self._chain_piece(blocks, index, stop, term, expand_everything)
+                piece = self._chain_piece(
+                    blocks, index, stop, term, expand_everything, show_work
+                )
                 if piece:
                     pieces.append(piece)
                 index = stop + 1
                 continue
 
-            piece = self._note_piece(blocks[index], index, term, expand_everything)
+            piece = self._note_piece(blocks[index], index, term, show_work)
             if piece:
                 pieces.append(piece)
             index += 1
 
         return pieces
 
-    def _add_heading(self, out, heading: str):
+    def _add_heading(self, out, heading: str, marker: str = ""):
         out.add_lines("")
         rule = "━" * max(3, HEADING_WIDTH - len(heading) - 4)
-        out.add_lines(f"━━ {heading} {rule}", ROLE_STYLES.get(heading, "bold"))
+        out.add_lines(f"━━ {heading} {rule}", ROLE_STYLES.get(heading, "bold"), marker=marker)
         out.add_lines("")
 
     def _answer_piece(self, block, index, role):
@@ -1537,11 +1565,10 @@ class ThreadView(ScrollableContainer):
 
         return draw
 
-    def _note_piece(self, block, index, term, expand_everything=False):
+    def _note_piece(self, block, index, term, show_work):
         """A short note the agent wrote while working, quoted with '>'"""
         text = block.get("content", "")
-        wanted = expand_everything or self.show_chain or (term and term in text.lower())
-        if not wanted or not text.strip():
+        if not show_work or not text.strip():
             return None
 
         def draw(out):
@@ -1551,12 +1578,12 @@ class ThreadView(ScrollableContainer):
 
         return draw
 
-    def _chain_piece(self, blocks, first, last, term, expand_everything):
+    def _chain_piece(self, blocks, first, last, term, expand_everything, show_work):
         """A run of thinking and tool steps, shown as one line until opened"""
         steps = list(range(first, last + 1))
         holds_term = term and any(term in blocks[i].get("content", "").lower() for i in steps)
 
-        if not (expand_everything or self.show_chain or holds_term):
+        if not show_work:
             return None
 
         # A chain and its first step are different things to fold, so the chain
@@ -1577,14 +1604,14 @@ class ThreadView(ScrollableContainer):
 
             def draw(out):
                 with out.region(key, "chain"):
-                    out.add_lines(label, CHAIN_STYLE)
+                    out.add_lines(label, CHAIN_STYLE, marker=FOLD_CLOSED)
 
             return draw
 
         def draw(out):
             # The header stays when the chain is open, so it can be closed again
             with out.region(key, "chain"):
-                out.add_lines(label, CHAIN_STYLE)
+                out.add_lines(label, CHAIN_STYLE, marker=FOLD_OPEN)
             for i in steps:
                 with out.region(i, blocks[i].get("role")):
                     self._add_foldable(out, blocks[i], i, term, expand_everything)
@@ -1605,6 +1632,7 @@ class ThreadView(ScrollableContainer):
 
         if not is_open:
             if not text.strip():
+                # Nothing to open, so no marker either
                 out.add_lines(f"{icon} {name}: (no text output)", style)
                 return
             lines = text.splitlines()
@@ -1613,10 +1641,10 @@ class ThreadView(ScrollableContainer):
             if len(flat) > TOOL_PREVIEW_CHARS:
                 head += " …"
             extra = f" ({len(lines)} lines)" if len(lines) > 1 else ""
-            out.add_lines(f"{icon} {name}{extra}: {head}", style)
+            out.add_lines(f"{icon} {name}{extra}: {head}", style, marker=FOLD_CLOSED)
             return
 
-        out.add_lines(f"{icon} {name}", style)
+        out.add_lines(f"{icon} {name}", style, marker=FOLD_OPEN)
         out.add_lines(text)
         out.add_lines("")
 
@@ -1649,7 +1677,6 @@ class ThreadView(ScrollableContainer):
             session.session_id,
             user_only,
             highlight_term,
-            self.show_chain,
             frozenset(self.expanded_blocks),
         )
         if key != self._layout_key:
@@ -2452,26 +2479,9 @@ class ClaudeYelpApp(App):
             f"Filter: {mode_text}", title="Filter Toggled", severity="information", timeout=2
         )
 
-    def action_toggle_chain(self):
-        """Show or hide how the agent worked, not just what it answered"""
-        if self.thread_view is None or self.session_list is None:
-            return
-
-        self.thread_view.show_chain = not self.thread_view.show_chain
-
-        session = self.session_list.get_selected_session()
-        if session:
-            self._show_session(session)
-            self._refind_matches()
-
-        state = "shown" if self.thread_view.show_chain else "hidden"
-        self.notify(
-            f"Agent's working steps {state}", title="Thread", severity="information", timeout=2
-        )
-
     def action_toggle_tool_output(self):
         """Open or close the chain or the single step the cursor sits in"""
-        self._toggle_block(FOLD_ROLES, "chain or step")
+        self._toggle_block(FOLD_ROLES, "foldable line")
 
     def _toggle_block(self, roles, what: str):
         """Fold or unfold the block under the thread cursor"""
@@ -2942,10 +2952,6 @@ class ClaudeYelpApp(App):
 
         if command in ("export full", "export-full", "ef"):
             self.action_export_session(full=True)
-            return
-
-        if command in ("show-thinking", "mind", "m"):
-            self.action_toggle_chain()
             return
 
         try:

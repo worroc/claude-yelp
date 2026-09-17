@@ -19,8 +19,8 @@ Claude Yelp provides a TUI (Text User Interface) for managing Claude Code CLI se
 - **Copy to clipboard**: Copy entire thread content or yank selected text
 - **Delete sessions**: Remove sessions with confirmation dialog
 - **User-only mode**: Toggle to show only user messages in the thread view
-- **Two thread views**: by default only what the agent answered; `m` also shows its notes and one line per chain of thinking and tool calls
-- **Thread cursor**: A lit gutter shows the current line; `o` opens what it sits on
+- **Folding thread**: by default only what the agent answered; open a turn to see its notes and one line per chain of tool steps, then open those
+- **Thread cursor**: a `▸` marks every line that opens, a lit column shows where the cursor is
 - **Resizable panels**: Adjust panel widths with keyboard shortcuts
 - **Vim-style navigation**: `gg`, `G`, `/`, `n`, `N`, `:` command mode
 - **Temporary sessions**: Create sessions that are auto-deleted on exit (`-t` flag)
@@ -55,7 +55,7 @@ These are the defaults. See [Configuration](#configuration) to change them.
 | `/` | Search mode (filters sessions in left panel, searches text in right panel) |
 | `n` | Next search match |
 | `N` / `p` | Previous search match |
-| `:` | Command mode. A number jumps to a session, or to a line when the thread pane has focus. Commands: `export`, `export full`, `show-thinking`, `quit`. `TAB` completes |
+| `:` | Command mode. A number jumps to a session, or to a line when the thread pane has focus. Commands: `export`, `export full`, `quit`. `TAB` completes |
 
 ### Clipboard
 | Key | Action |
@@ -66,9 +66,8 @@ These are the defaults. See [Configuration](#configuration) to change them.
 ### Other
 | Key | Action |
 |-----|--------|
-| `m` | Show/hide how the agent worked (mind view) |
 | `u` | Toggle user-only message filter |
-| `o` | Open/close what the thread cursor is on: a chain, or one step inside it |
+| `o` | Open/close what the thread cursor is on: an agent turn, a chain, or one step |
 | `Escape` | Cancel/close modal |
 | `q` | Quit |
 
